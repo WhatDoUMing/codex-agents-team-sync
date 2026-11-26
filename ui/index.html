@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>团队进度同步器 · Local Team Sync</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<body>
+<header><div class="brand"><span class="logo">◈</span><div><h1>团队进度同步器</h1><p>LOCAL TEAM SYNC · 仅在本机</p></div></div><button id="logout" class="secondary" hidden>锁定面板</button></header>
+<main>
+<section class="intro"><span class="eyebrow">一个视图，分清事实与推测</span><h2>看清进度，再发指令。</h2><p>按项目和团队查看主动接入的 worker。排队不等于接收，心跳不等于真实进程存活。</p></section>
+<section id="login" class="card login"><h3>连接本地会话</h3><p>从启动终端复制本次「Session access key」。密钥不放在网址中，仅保留在当前标签页的会话存储。</p><form id="login-form"><label for="access-key">会话访问密钥</label><div class="row"><input id="access-key" type="password" autocomplete="off" spellcheck="false" required placeholder="粘贴本次会话密钥"><button type="submit">解锁面板</button></div></form></section>
+<div id="notice" role="status" aria-live="polite"></div>
+<div id="dashboard" hidden>
+<div class="toolbar"><div class="row"><label for="project">项目</label><select id="project"><option value="">全部项目</option></select><button id="refresh" class="secondary">立即刷新</button></div><p id="updated">尚未读取</p></div>
+<div class="metrics"><article><span id="count-workers">0</span><p>已登记 worker</p></article><article><span id="count-fresh">0</span><p>新鲜的自报心跳</p></article><article><span id="count-queued">0</span><p>当前显示的排队指令</p></article><article><span id="count-sources">0</span><p>已配置只读源</p></article></div>
+<section class="scope" aria-labelledby="loop-title"><div class="section-head"><div><h3 id="loop-title">Loop 工作池 · 潮汐之核</h3><p id="loop-source" role="status">尚未读取 Loop 状态</p></div><button id="loop-refresh" class="secondary" type="button">刷新 Loop</button></div><p id="loop-rules"></p><div id="loop-runs" class="worker-grid"></div><p class="detail">任务状态来自 Loop 回执。控制只适用于下方绑定的规则，不影响其他任务。</p></section>
+<section id="loop-control" class="scope" hidden><h3>潮核团队控制</h3><label for="loop-rule">岗位或规则</label><select id="loop-rule" disabled></select><p id="control-model" class="detail"></p><p id="control-status" role="status"></p><div class="row"><button id="loop-run" type="button" disabled>立即运行</button><button id="loop-pause" type="button" disabled>暂停后续派发</button><button id="loop-resume" type="button" disabled>恢复派发</button></div><p id="control-result" role="status"></p><p class="detail">暂停不会停止已领取的任务；恢复不会补跑已跳过的事件。</p></section>
+<section id="loop-probe" class="scope" hidden><h3>隔离派单验证</h3><p id="probe-status" role="status"></p><button id="probe-dispatch" type="button" disabled>派发一次只读测试</button></section>
+<section class="scope"><strong>覆盖边界</strong><p>仅包含主动登记的 worker 与显式配置的只读数据源。不会自动发现或接管已有 Dot / Codex 会话；真实 worker 仅限本服务新建并持有连接的独立会话。协作能力是调用者声明；已接收和已完成也只是消费者回报，不是独立执行证明。最近 100 条指令可见。</p></section>
+<section><div class="section-head"><div><h3>团队与 worker</h3><p>心跳超过 30 秒标为过期；终态不会被迟到心跳复活。</p></div><div class="row"><button id="start-demo" class="secondary">启动回显演示</button><button id="start-owned" hidden>新建真实 Codex 会话 worker</button></div></div><p id="owned-note" class="detail">真实会话桥接默认关闭，需要显式 --codex-cli。不会自动启动模型或接管原会话。</p><div id="workers" class="worker-grid"></div></section>
+<section class="card compose"><h3>向协作收件箱发指令</h3><p>只加入本地队列，不会替你执行命令。未接入协议、心跳过期、已结束和旧数据源均不能投递。</p><form id="command-form"><label for="target">目标 worker</label><select id="target" required></select><label for="delivery-mode">投递方式</label><select id="delivery-mode" disabled><option value="queue">排队，空闲后开启下一轮</option><option value="steer">追加到当前活跃轮次（仅自有真实 worker）</option></select><label for="instruction">指令内容</label><textarea id="instruction" rows="3" maxlength="8000" required placeholder="例如：先暂停新增内容，回报已完成项和阻塞项。演示 worker 只会原样回显。"></textarea><div class="form-footer"><span>queued → acknowledged → completed / rejected</span><button id="send" type="submit">加入本地队列</button></div></form></section>
+<section><div class="section-head"><div><h3>指令流水</h3><p>已领取后崩溃的指令会保留「已接收、未完成」，不会自动重投执行。</p></div></div><div id="commands"></div></section>
+<section><div class="section-head"><div><h3>只读项目数据源与真实会话</h3><p>显式配置旧 SQLite 或官方 App Server 元数据。只读观察，不冒充网页可向原生会话发指令。</p></div></div><div id="sources"></div></section>
+</div>
+<footer>本地存储 · 无外部脚本 · 默认不调用模型，真实worker显式启用并消耗额度 · 不直接执行shell输入</footer>
+</main></body></html>

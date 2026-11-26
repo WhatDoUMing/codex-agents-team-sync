@@ -1,0 +1,48 @@
+# Local databases, queues, runtime state and authentication
+/data/
+/owned-workspaces/
+/.runtime/
+/runtime/
+/.secrets/
+/.env
+/.env.*
+!/.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.key
+*.pem
+*.p12
+*.pfx
+/session-key*
+/access-key*
+/credentials*.json
+/auth*.json
+
+# Verification outputs can contain local paths, titles, commands or screenshots.
+# Keep only a generic, non-private reproduction guide.
+/verification/*
+!/verification/README.md
+
+# Handoff backups and partial writes, not release sources
+/sync.initial.py.txt
+*.pending
+*.bak
+*.tmp
+
+# Python / optional development tools
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+node_modules/
+.DS_Store
+Thumbs.db
