@@ -13,6 +13,11 @@ def chunk(kind,data):
     body=kind+data
     return struct.pack(">I",len(data))+body+struct.pack(">I",zlib.crc32(body))
 
+def image_with_pixels(depth=8,color=2,pixels=b"\0\0\0\0",interlace=0,tail=b""):
+    header = struct.pack(">IIBBBBB",1,1,depth,color,0,0,interlace)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR",header) +
+            chunk(b"IDAT",zlib.compress(pixels)+tail) + chunk(b"IEND",b""))
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -24,8 +29,7 @@ class EvidenceTests(unittest.TestCase):
         manifest=json.dumps({"files":[{"path":"previews/lv01_ch01/ch01_story_preview.gd","sha256":"b"*64}]}).encode()
         (self.root.parent/"source-manifest.json").write_bytes(manifest)
         self.candidate=hashlib.sha256(manifest).hexdigest()
-        self.image=(b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">IIBBBBB",1,1,8,2,0,0,0))+
-                    chunk(b"IDAT",zlib.compress(b"\0\0\0\0"))+chunk(b"IEND",b""))
+        self.image=image_with_pixels()
 
     def route(self,name,version=2,sha=None):
         directory=self.root/name
@@ -58,3 +62,23 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(self.library.inspect(2,normal+";"+ret)["same_candidate"])
         for outside in ("../../summary.json","missing/summary.json","//unavailable.test/share/summary.json",normal+";"+normal):
             self.assertFalse(self.library.inspect(2,outside)["same_candidate"])
+
+    def test_bound_images_require_legal_header_and_decodable_scanlines(self):
+        refs=self.route("normal")+";"+self.route("return")
+        frame=self.root/"return"/"last.png"
+        good=self.library.inspect(2,refs)["routes"][1]["frame_sha256"]
+        for wrong in (image_with_pixels(depth=7), image_with_pixels(color=7),
+                      image_with_pixels(color=3), image_with_pixels(interlace=2),
+                      image_with_pixels(pixels=b"\x05abc"), image_with_pixels(pixels=b"\0ab"),
+                      image_with_pixels(pixels=b"\0abcd"), image_with_pixels(tail=b"trailing stream")):
+            with self.subTest(sha=hashlib.sha256(wrong).hexdigest()):
+                frame.write_bytes(wrong)
+                view=self.library.inspect(2,refs)
+                self.assertFalse(view["same_candidate"])
+                self.assertEqual(view["routes"][1]["outcome"],"missing")
+                with self.assertRaises(ValueError):
+                    self.library.inspect(2,refs,"return")
+        frame.write_bytes(image_with_pixels(interlace=1,pixels=b"\x04ABC"))
+        view=self.library.inspect(2,refs)
+        self.assertTrue(view["same_candidate"])
+        self.assertNotEqual(view["routes"][1]["frame_sha256"],good)

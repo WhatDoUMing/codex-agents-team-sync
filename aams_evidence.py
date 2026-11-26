@@ -44,11 +44,46 @@ def as_json(path):
     return value
 
 
+def png_pixels(header, compressed):
+    width, height, depth, color, compression, filtering, interlace = header
+    depths = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+    if (depth not in depths.get(color, ()) or compression != 0 or filtering != 0 or interlace not in (0, 1)
+            or not 0 < width * height <= 16_777_216):
+        raise ValueError("视口 PNG 的尺寸或像素格式无效")
+    bits = depth * {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+    passes = [(0, 0, 1, 1)] if interlace == 0 else [
+        (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+        (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)]
+    rows = []
+    for x, y, dx, dy in passes:
+        if x < width and y < height:
+            pixels = (width - x + dx - 1) // dx
+            rows.append(((height - y + dy - 1) // dy, 1 + (pixels * bits + 7) // 8))
+    expected = sum(count * stride for count, stride in rows)
+    if expected > 64_000_000:
+        raise ValueError("视口 PNG 超出可核对的像素范围")
+    stream = zlib.decompressobj()
+    try:
+        decoded = stream.decompress(compressed, expected + 1)
+    except zlib.error as exc:
+        raise ValueError("视口 PNG 像素流无法解码") from exc
+    if not stream.eof or stream.unused_data or stream.unconsumed_tail or len(decoded) != expected:
+        raise ValueError("视口 PNG 像素流与画面尺寸不符")
+    offset = 0
+    for count, stride in rows:
+        end = offset + count * stride
+        if any(kind > 4 for kind in decoded[offset:end:stride]):
+            raise ValueError("视口 PNG 的行滤镜无效")
+        offset = end
+
+
 def png(directory, name):
     data = contents(local_file(directory, name), 12_000_000)
     if not name.lower().endswith(".png") or not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("视口 PNG 无效")
-    offset, chunks = 8, []
+    offset, header, previous = 8, None, None
+    palette = saw_data = False
+    compressed = bytearray()
     while offset + 12 <= len(data):
         size = struct.unpack_from(">I", data, offset)[0]
         end = offset + size + 12
@@ -57,14 +92,34 @@ def png(directory, name):
         chunk = data[offset + 4:end - 4]
         if zlib.crc32(chunk) != struct.unpack_from(">I", data, end - 4)[0]:
             raise ValueError("视口 PNG 校验失败")
-        chunks.append(chunk[:4])
-        if len(chunks) == 1 and (chunks[0] != b"IHDR" or size != 13 or min(struct.unpack(">II",chunk[4:12])) < 1):
-            raise ValueError("视口 PNG 缺少有效尺寸")
+        kind = chunk[:4]
+        if previous is None:
+            if kind != b"IHDR" or size != 13:
+                raise ValueError("视口 PNG 缺少有效画面头")
+            header = struct.unpack(">IIBBBBB", chunk[4:])
+        elif kind == b"PLTE":
+            if (palette or saw_data or header[3] in (0, 4)
+                    or size % 3 or not 0 < size <= 768
+                    or (header[3] == 3 and size // 3 > (1 << header[2]))):
+                raise ValueError("视口 PNG 调色板无效")
+            palette = True
+        elif kind == b"IDAT":
+            if (saw_data and previous != b"IDAT") or (header[3] == 3 and not palette):
+                raise ValueError("视口 PNG 像素数据分块无效")
+            saw_data = True
+            compressed.extend(chunk[4:])
+        elif kind == b"IEND":
+            if size != 0:
+                raise ValueError("视口 PNG 结束块无效")
+        elif not re.fullmatch(rb"[a-z][A-Za-z][A-Z][A-Za-z]", kind):
+            raise ValueError("视口 PNG 含无效或未知的关键块")
         offset = end
-        if chunks[-1] == b"IEND":
+        previous = kind
+        if kind == b"IEND":
             break
-    if offset != len(data) or not chunks or chunks[-1] != b"IEND" or b"IDAT" not in chunks:
+    if offset != len(data) or previous != b"IEND" or not compressed:
         raise ValueError("视口 PNG 缺少完整画面")
+    png_pixels(header, compressed)
     return data
 
 
@@ -139,7 +194,7 @@ class EvidenceLibrary:
                         or len(set(frames)) != len(frames)):
                     raise ValueError("缺少完整的视口截图清单")
                 for image in frames:
-                    png(directory,image)
+                    frame = png(directory,image)
                 events = [json.loads(s) for s in contents(local_file(directory,"events.jsonl"),10_000_000).splitlines() if s.strip()]
                 sent = sum(v.get("event")=="key_sent" for v in events)
                 received = sum(v.get("event")=="key_received" for v in events)
@@ -156,6 +211,7 @@ class EvidenceLibrary:
                     raise ValueError("路线结论缺少终点或首卡点")
                 verified[route] = ({"route":route,"label":LABELS[route],"outcome":outcome,"detail":actual[:250],
                     "candidate":candidate,"story":story,"keys":sent,"screenshots":len(frames),
+                    "frame_sha256":hashlib.sha256(frame).hexdigest(),
                     "summary_sha256":hashlib.sha256(contents(local_file(directory,"summary.json"),1_000_000)).hexdigest()},
                     directory,frames[-1])
             except (ValueError, TypeError, OSError, KeyError, AttributeError, struct.error) as exc:
