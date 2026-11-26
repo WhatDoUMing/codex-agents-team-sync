@@ -2,6 +2,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import os
 from pathlib import Path
 import secrets
 import socket
@@ -13,6 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 import sync
 import loop_status
 import loop_control
+from aams_orders import LocalLoop, OrderBoard, Conflict
+from aams_evidence import EvidenceLibrary, ROUTES
 
 ASSETS = Path(__file__).resolve().parent / "ui"
 MAX_BODY = 40000
@@ -49,6 +52,11 @@ class LoopbackHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
+    def server_close(self):
+        if getattr(self, "orders", None) is not None:
+            self.orders.close()
+        super().server_close()
+
 
 def json_bytes(value):
     # Foreign legacy databases can contain nonfinite REAL values. Emit valid JSON.
@@ -79,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
                 "Cross-Origin-Resource-Policy": "same-origin",
-                "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+                "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
             }.items():
                 self.send_header(key, value)
             self.end_headers()
@@ -132,6 +140,34 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/api/loop/status" and not parts.query:
             if self._validate(authenticated=True):
                 self._reply(200, loop_status.read_status())
+            return
+        if parts.path == "/api/aams/order" and not parts.query:
+            if self._validate(authenticated=True):
+                self._reply(200, self.server.orders.view() if self.server.orders else {"enabled": False})
+            return
+        if parts.path == "/api/aams/evidence":
+            if not self._validate(authenticated=True):
+                return
+            try:
+                query = parse_qs(parts.query, strict_parsing=True, keep_blank_values=True, max_num_fields=3)
+                if (self.server.orders is None or set(query)-{"version","run","frame"} or
+                        any(len(v)!=1 for v in query.values())):
+                    raise ValueError("只能查看本单已有的执行者回执")
+                version, run = int(query["version"][0]), int(query["run"][0])
+                frame = query.get("frame",[None])[0]
+                if frame is not None and frame not in ROUTES:
+                    raise ValueError("未知路线")
+                with sync.connect(self.server.db_path, readonly=True) as db:
+                    row = db.execute("""SELECT evidence FROM aams_deliveries WHERE version=? AND run_id=?
+                        AND role!='manager' AND state IN ('reported','blocked')""",(version,run)).fetchone()
+                if not row:
+                    raise ValueError("没有该轮可查看的执行者证据")
+                result = self.server.evidence.inspect(version,row["evidence"],frame)
+                if frame and not isinstance(result,bytes):
+                    raise ValueError("该路线没有可查看的截图")
+                self._reply(200,result,"image/png" if frame else "application/json; charset=utf-8")
+            except (ValueError, KeyError, sqlite3.Error, OSError):
+                self._reply(404,{"error":"该轮实录或视口文件不可用"})
             return
         if parts.path == "/api/loop/control":
             if self._validate(authenticated=True):
@@ -201,6 +237,25 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._reply(200, {"token": self.server.access_token})
                 return
+            if self.path in ("/api/aams/order","/api/aams/order/continue"):
+                if self.server.orders is None:
+                    self._reply(403, {"error": "请在本机操作看板派单"})
+                    return
+                try:
+                    if self.path.endswith("/continue"):
+                        if set(body) != {"expected_version","after_run"}:
+                            raise ValueError("需要本版号和上一份执行者回执的轮次")
+                        self.server.orders.continue_result(**body)
+                        version = body["expected_version"]
+                    else:
+                        if set(body) != {"expected_version", "instruction", "acceptance"}:
+                            raise ValueError("需要当前版号、主管指令和验收条件")
+                        version = self.server.orders.issue(**body)
+                except Conflict as exc:
+                    self._reply(409, {"error": str(exc)})
+                    return
+                self._reply(200, {"version": version})
+                return
             if self.path == "/api/loop/control":
                 action = body.get("action")
                 rule = body.get("rule", loop_control.RULE)
@@ -264,7 +319,7 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = do_PUT
 
 
-def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, codex_cli=None, owned_factory=None, loop_probe=None, control=None, open_browser=False):
+def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, codex_cli=None, owned_factory=None, loop_probe=None, control=None, open_browser=False, order_loop=None, evidence_root=None):
     if host != "127.0.0.1":
         raise ValueError("only 127.0.0.1 loopback binding is permitted")
     if type(port) is not int or not 0 <= port <= 65535:
@@ -299,6 +354,15 @@ def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, co
         except Exception:
             server.server_close()
             raise
+    server.orders = None
+    server.evidence = EvidenceLibrary(evidence_root)
+    if order_loop is not None:
+        try:
+            server.orders = OrderBoard(path, order_loop)
+            server.orders.start()
+        except Exception:
+            server.server_close()
+            raise
     return server
 
 
@@ -312,8 +376,10 @@ def open_local_dashboard(url):
 
 
 def serve(path, host="127.0.0.1", port=8765, source=None, codex_cli=None, open_browser=False):
+    control = loop_control.configured()
     server = create_server(path, host, port, source=source, codex_cli=codex_cli,
-                           control=loop_control.configured(), open_browser=open_browser)
+                           control=control, open_browser=open_browser, order_loop=LocalLoop() if control else None,
+                           evidence_root=os.environ.get("AAMS_EVIDENCE_ROOT") if control else None)
     url = "http://" + server.launch_host + "/"
     print("Local dashboard: " + url, flush=True)
     print("Session access key (manual fallback only; not in URL): " + server.access_token, flush=True)

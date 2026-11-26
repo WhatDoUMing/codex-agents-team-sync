@@ -9,6 +9,7 @@ from unittest.mock import patch
 import native_adapter
 import sync
 import web_server
+from aams_orders import LocalLoop
 from test_sync import make_legacy
 
 
@@ -46,7 +47,8 @@ def main():
         native_mock.start()
         sync.source_add(db, "native-fixture", "native-fixture", fake_cli,
                         "Official metadata UI fixture", "codex-app-server", native_scope)
-        server = web_server.create_server(db, port=0, open_browser=True)
+        # This empty local fixture has no Loop configuration or keys. Browser orders stay pending here.
+        server = web_server.create_server(db, port=0, open_browser=True, order_loop=LocalLoop(root))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         env = {**os.environ, "TEAM_SYNC_QA_URL": "http://127.0.0.1:%d/" % server.server_address[1],

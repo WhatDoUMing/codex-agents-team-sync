@@ -1,32 +1,46 @@
-# CAS 潮汐之核 Loop 只读看板
+# AAMS 潮核 Loop 看板
 
-先让原有 Loop Hub 运行。在此候选仓库运行 `start-loop-panel.cmd`，
-打开终端显示的本机地址（默认 http://127.0.0.1:8766/），用同一窗口给出的
-CAS 会话密钥解锁。浏览器不会收到 Loop 自身的密钥。
+双击 `start-loop-control.cmd` 打开本机操作看板。AAMS 用当前标签页的会话密钥保护接口，默认地址为 `http://127.0.0.1:8766/`。浏览器会自动连接，手动新开标签页时可以使用终端显示的备用密钥。已有 Loop Hub 应当在本机 3350 端口运行。
 
-读取本机官方 Loop CLI 的 `status --json`，仅显示标记为 tidecore 的规则和轮次，
-也兼容现有规则“潮汐之核进度只读梳理”。已领取不等于独立证实执行。页面断连时
-清除旧状态，不使用假数据。普通只读启动器没有派单、暂停或纠正能力；不会改 Loop
-规则，不会启动 Loop 或 Codex。
-## 隔离验收
+## 首章鱼摊指令
 
-正式启动器仍只显示看板，不开启派单。需要验证时，在 Windows 候选目录运行
-`python -B verify_loop_panel.py`。脚本会临时启动独立 Loop 和 CAS、启用一次性
-测试按钮，在隔离的无头浏览器点击，并核对同一轮的完成回执和 Codex 工具的真实
-文件读取。测试文件没有业务数据。脚本不安装服务、不重用浏览器资料或生产规则；
-如派发结果不确定，不再派第二单。Codex CLI 可通过 `TEAM_SYNC_CODEX_CLI` 指定
-可信可执行文件的完整路径，或由脚本从官方 Windows 应用中查找。测试沿用已设置的
-`CODEX_HOME`，默认用用户目录下的 `.codex`。上游源码版本见 README。
+在「潮核协议 · 首章鱼摊复测」填写主管指令和验收条件。第一次发布生成 v1，后续改令保留任务号 `TP-CH01-FISH-01`。状态栏分别显示最新指令和执行者已确认的版号，历史记录保留每版的事件、轮次、结果与证据。
 
-已验证：浏览器同一单号 1 收到完成回执，Codex 实际读出同一测试标记；生产
-规则文件 SHA-256 未变。该结果不代表生产任务已开放派发。
+管理员的 Loop 回执明确分派给 `tp-playtest` 后，看板才投递给执行者。执行者可确认版号、报告受阻，或交回复测结果。单个 Loop 轮次的终态回执固定。当前版最后一份执行者回执为 ACK 或 BLOCKED 时，点击「请原执行者补交同版实录」，由同一执行者在新的轮次核对本版已有实录。旧回执可从历史中对照。
 
-## 本机操作版
+启动前可将环境变量 `AAMS_EVIDENCE_ROOT` 指向该任务本机的 `qa_runs` 目录。执行者在回执最后一栏写出正常线和折返线各自的 `qa_runs/<运行目录>/summary.json`，用中文分号分隔。看板核对每份摘要的版号、路线、启动指纹、按键轨迹和视口 PNG，提供最后一帧预览。两份实录的候选和鱼摊脚本指纹一致时显示同一候选。执行者自报、可查实录、独立验收是三个不同的状态。
 
-运行 `start-loop-control.cmd`，会自动打开并连接浏览器，不用手输会话密钥。操作版只显示本机 Loop 上已经登记、标签与岗位一致的规则：管理员、剧情与关卡结构、地图与场景、战斗与机关、固定动画专员、独立审核与验收，以及原有只读梳理规则。网页可立即
-已连接的标签页可直接刷新。手动新开标签或者浏览器未自动打开时，仍可通过终端的备用密钥连接。
-运行、暂停后续派发或恢复派发；不会停掉已领取的轮次、补跑跳过的事件或接受任意指令。
-生产 Hub 不会由 CAS 启动。Loop 自身的密钥留在服务端，不会返回给浏览器。
+### 配置两个 Loop 岗位
 
-暂停和恢复以 Loop 新状态为准，派单回传实际轮次编号；同规则有未完成轮次时不会
-再派。无响应时不会自动重试。普通看板仍可用 `start-loop-panel.cmd` 打开。
+在已有本地来源 `local` 和实际已注册的 worker 上，按下例将两个岗位和对应规则加入自己的 Loop 配置。把 `your-worker` 替换为当前 worker 名，把两个 `cwd` 替换为各自的本机绝对目录。管理员只读交接，试玩岗使用独立副本保存实录。先用 `agent-autoloop check` 校验，再按本机 Loop 的生效方式载入。
+
+```json
+{
+  "agents": {
+    "tp-manager": {"name": "潮核项目管理员", "use": "codex", "worker": "your-worker", "access": "read", "maxActive": 1},
+    "tp-playtest": {"name": "潮核试玩复测", "use": "codex", "worker": "your-worker", "access": "edit", "maxActive": 1}
+  },
+  "rules": [
+    {
+      "name": "AAMS·潮核项目管理员", "when": {"source": "local", "types": ["tp.aams.manager"]},
+      "to": "tp-manager", "cwd": "<管理员本地目录>", "tags": ["tidecore", "tp-manager", "aams"],
+      "prompt": "读取本轮 context.events 的 detail，核对 task、version 和实际 event.id。根据本版指令决定 DELEGATE tp-playtest 或 BLOCKED，最终首行使用 receipt_format 的完整绑定码。",
+      "tell": "never", "maxActive": 1
+    },
+    {
+      "name": "AAMS·潮核试玩复测", "when": {"source": "local", "types": ["tp.aams.playtest"]},
+      "to": "tp-playtest", "cwd": "<独立试玩目录>", "tags": ["tidecore", "tp-playtest", "aams"],
+      "prompt": "读取本轮 context.events 的 detail，按 instruction、acceptance 和 continuation 执行。按 receipt_format 用简短首行交 ACK、RESULT 或 BLOCKED，附实际结果及可打开的版本证据。续收时仅核验既有实录。",
+      "tell": "never", "maxActive": 1
+    }
+  ]
+}
+```
+
+2026-11-26 白天的隔离验收用独立 Loop、浏览器和标记文件验证过一次真实 Codex 读取。另有固定命令 worker 测试经理分派、版号和回执。11 月 26 日晚的首章正式任务使用真实主管、管理员和试玩执行者，结果见本机操作看板中的相应轮次。
+
+## 只读看板与团队控制
+
+`start-loop-panel.cmd` 打开只读看板，读取 Loop CLI 的 `status --json`，显示属于潮核的规则和轮次。它和操作版是两个启动方式。操作版保留现有岗位的运行、暂停后续派发和恢复按钮。暂停后，已领取的轮次继续运行。恢复后，已跳过的事件仍可在历史中核对。
+
+需复测独立的浏览器标记流程时，在仓库根目录运行 `python -B verify_loop_panel.py`。可以用 `TEAM_SYNC_CODEX_CLI` 指定可信 Codex 的完整路径，公开版也可查找官方 Windows 安装。测试用当前 `CODEX_HOME` 或当前用户的默认目录。

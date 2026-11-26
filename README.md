@@ -1,4 +1,6 @@
-# 团队进度同步器 · Local Team Sync
+# AAMS · Agents Auto-Loop Management System
+
+在 Windows 上运行 `start-loop-control.cmd` 可打开本机主管看板。首章鱼摊复测支持按版号下达和修订指令，跟踪管理员分派、执行者确认与两条路线的实录。[岗位配置和使用说明](LOOP-PANEL.zh.md)
 
 本仓库使用第三方开源项目 **Agent Autoloop**（KKKKhazix/agent-autoloop）提供的 Hub、规则和 worker 软件。本仓库负责展示项目、团队与 worker 状态，提供本地收件箱，并记录派单、回执和纠偏的状态。上游 Hub 根据规则匹配事件、排队派发，由上游 worker 领取任务、启动配置的执行程序并回传结果。[Agent Autoloop 源码仓库](https://github.com/KKKKhazix/agent-autoloop)
 

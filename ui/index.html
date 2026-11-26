@@ -1,14 +1,22 @@
 <!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>团队进度同步器 · Local Team Sync</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<title>AAMS · 团队进度同步器</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
 <body>
-<header><div class="brand"><span class="logo">◈</span><div><h1>团队进度同步器</h1><p>LOCAL TEAM SYNC · 仅在本机</p></div></div><button id="logout" class="secondary" hidden>锁定面板</button></header>
+<header><div class="brand"><span class="logo">◈</span><div><h1>AAMS 团队进度看板</h1><p>Agents Auto-Loop Management System</p></div></div><button id="logout" class="secondary" hidden>锁定面板</button></header>
 <main>
 <section class="intro"><span class="eyebrow">一个视图，分清事实与推测</span><h2>看清进度，再发指令。</h2><p>按项目和团队查看主动接入的 worker。排队不等于接收，心跳不等于真实进程存活。</p></section>
 <section id="login" class="card login"><h3>连接本地会话</h3><p>从启动终端复制本次「Session access key」。密钥不放在网址中，仅保留在当前标签页的会话存储。</p><form id="login-form"><label for="access-key">会话访问密钥</label><div class="row"><input id="access-key" type="password" autocomplete="off" spellcheck="false" required placeholder="粘贴本次会话密钥"><button type="submit">解锁面板</button></div></form></section>
 <div id="notice" role="status" aria-live="polite"></div>
 <div id="dashboard" hidden>
+<section id="aams-order" class="card compose" hidden>
+<h3>潮核协议 · 首章鱼摊复测</h3><p>TP-CH01-FISH-01</p>
+<p id="order-status" role="status"></p>
+<form id="order-form"><label for="order-instruction">主管指令</label><textarea id="order-instruction" required maxlength="950" rows="2"></textarea>
+<label for="order-acceptance">验收条件</label><textarea id="order-acceptance" required maxlength="950" rows="2"></textarea>
+<div class="form-footer"><span id="order-next"></span><div class="row"><button id="order-rebase" type="button" class="secondary" hidden>已核对新版，继续编辑</button><button id="order-submit" type="submit" disabled>下达指令</button></div></div></form>
+<p id="order-notice" role="status"></p><div id="order-history"></div>
+</section>
 <div class="toolbar"><div class="row"><label for="project">项目</label><select id="project"><option value="">全部项目</option></select><button id="refresh" class="secondary">立即刷新</button></div><p id="updated">尚未读取</p></div>
 <div class="metrics"><article><span id="count-workers">0</span><p>已登记 worker</p></article><article><span id="count-fresh">0</span><p>新鲜的自报心跳</p></article><article><span id="count-queued">0</span><p>当前显示的排队指令</p></article><article><span id="count-sources">0</span><p>已配置只读源</p></article></div>
 <section class="scope" aria-labelledby="loop-title"><div class="section-head"><div><h3 id="loop-title">Loop 工作池 · 潮汐之核</h3><p id="loop-source" role="status">尚未读取 Loop 状态</p></div><button id="loop-refresh" class="secondary" type="button">刷新 Loop</button></div><p id="loop-rules"></p><div id="loop-runs" class="worker-grid"></div><p class="detail">任务状态来自 Loop 回执。控制只适用于下方绑定的规则，不影响其他任务。</p></section>

@@ -46,7 +46,8 @@ def number(value):
 def _schema_guard(db, allow_empty=False):
     names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
     app_id = db.execute("PRAGMA application_id").fetchone()[0]
-    if app_id not in (0, APP_ID) or names - {"workers", "commands", "sources", "codex_sessions", "codex_deliveries"}:
+    if app_id not in (0, APP_ID) or names - {"workers", "commands", "sources", "codex_sessions", "codex_deliveries",
+                                               "aams_orders", "aams_deliveries"}:
         raise ValueError("refusing to write an unrelated database")
     if not names and allow_empty:
         return

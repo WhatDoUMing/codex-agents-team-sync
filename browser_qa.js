@@ -85,6 +85,13 @@ async function screenshot(name,width,height){
   await login(token);
   await wait("!document.getElementById('dashboard').hidden&&latest!==null","valid key unlock");
   pass("authenticated worker and source cards render");
+  await wait("!$('aams-order').hidden&&!$('order-submit').disabled","local AAMS order form");
+  await evaluate("$('order-instruction').value='QA normal route';$('order-acceptance').value='QA actual evidence';$('order-form').requestSubmit()");
+  await wait("displayedVersion===1&&$('order-history').textContent.includes('QA normal route')","version 1 entered from browser");
+  await evaluate("$('order-instruction').value='QA both routes';$('order-acceptance').value='QA two records';$('order-form').requestSubmit()");
+  await wait("displayedVersion===2&&$('order-history').children.length===2","version 2 retains historical instructions");
+  assert.equal(await evaluate("$('order-status').textContent.includes('等待执行者确认')"),true);
+  pass("versioned AAMS orders preserve history and await a genuine receiver");
   assert.equal(await evaluate("latest.workers.find(w=>w.id==='expired-worker').status"),"stale");
   assert.equal(await evaluate("[...document.getElementById('target').options].some(o=>o.value.includes('manual-observer')||o.value.includes('expired-worker'))"),false);
   pass("manual and expired workers cannot be instruction targets");
@@ -162,6 +169,7 @@ async function screenshot(name,width,height){
   await delay(300);
   assert.equal(await evaluate("document.getElementById('dashboard').hidden"),true);
   assert.equal(await evaluate("document.getElementById('workers').childElementCount"),0);
+  assert.equal(await evaluate("document.getElementById('order-history').childElementCount"),0);
   assert.equal(await evaluate("sessionStorage.getItem('team-sync-session')"),null);
   pass("lock stays locked when an older in-flight snapshot resolves");
   await login(token);

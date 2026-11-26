@@ -46,6 +46,10 @@ def local_request(owner, method, path, data=None, *, port=3350):
     try:
         headers = {"Authorization":"Bearer "+owner, "Content-Type":"application/json"}
         body = None if data is None else json.dumps(data, ensure_ascii=True).encode("ascii")
+        try:
+            con.connect()
+        except OSError as exc:
+            raise NotSent("connection failed before sending HTTP data") from exc
         con.request(method, path, body=body, headers=headers)
         res = con.getresponse()
         if res.status != 200:
@@ -65,6 +69,10 @@ def local_request(owner, method, path, data=None, *, port=3350):
 
 class Rejected(Exception):
     pass
+
+
+class NotSent(OSError):
+    """The socket connection failed before any HTTP bytes were sent."""
 
 
 class Control:

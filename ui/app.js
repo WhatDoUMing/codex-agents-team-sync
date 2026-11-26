@@ -44,11 +44,13 @@ async function request(path, body){
   if(!response.ok){ if(response.status===401)lock(); throw new Error(data.error||"请求失败"); }
   return data;
 }
-function lock(){$("loop-control").hidden=true;$("control-result").textContent="";$("loop-rule").replaceChildren();$("loop-rule").disabled=true;$("control-model").textContent="";$("loop-probe").hidden=true;$("probe-dispatch").disabled=true;$("loop-source").textContent="尚未读取 Loop 状态";$("loop-rules").textContent="";$("loop-runs").replaceChildren();sessionEpoch++;viewEpoch++;refreshSequence++;refreshBusy=false;token="";sessionStorage.removeItem("team-sync-session");latest=null;knownProjects.clear();$("login").hidden=false;$("dashboard").hidden=true;$("logout").hidden=true;$("access-key").value="";$("workers").replaceChildren();$("commands").replaceChildren();$("sources").replaceChildren();$("target").replaceChildren();$("instruction").value="";$("project").replaceChildren(el("option","","全部项目"));$("project").firstChild.value="";commandAttempt=null;demoAttempt=null;ownedAttempt=null;composerFlight=null;$("instruction").disabled=false;$("target").disabled=false;$("delivery-mode").value="queue";$("delivery-mode").disabled=true;}
+function lock(){
+  clearOrder();
+  $("loop-control").hidden=true;$("control-result").textContent="";$("loop-rule").replaceChildren();$("loop-rule").disabled=true;$("control-model").textContent="";$("loop-probe").hidden=true;$("probe-dispatch").disabled=true;$("loop-source").textContent="尚未读取 Loop 状态";$("loop-rules").textContent="";$("loop-runs").replaceChildren();sessionEpoch++;viewEpoch++;refreshSequence++;refreshBusy=false;token="";sessionStorage.removeItem("team-sync-session");latest=null;knownProjects.clear();$("login").hidden=false;$("dashboard").hidden=true;$("logout").hidden=true;$("access-key").value="";$("workers").replaceChildren();$("commands").replaceChildren();$("sources").replaceChildren();$("target").replaceChildren();$("instruction").value="";$("project").replaceChildren(el("option","","全部项目"));$("project").firstChild.value="";commandAttempt=null;demoAttempt=null;ownedAttempt=null;composerFlight=null;$("instruction").disabled=false;$("target").disabled=false;$("delivery-mode").value="queue";$("delivery-mode").disabled=true;}
 function render(snapshot){
   const firstRender=$("dashboard").hidden;
   latest=snapshot;
-  $("login").hidden=true;$("dashboard").hidden=false;$("logout").hidden=false; if(firstRender){void refreshLoop();void refreshProbe();void refreshControl();}
+  $("login").hidden=true;$("dashboard").hidden=false;$("logout").hidden=false; if(firstRender){clearOrder();void refreshOrder();void refreshLoop();void refreshProbe();void refreshControl();}
   const project=$("project").value;
   const enabled=!!(snapshot.owned_codex&&snapshot.owned_codex.enabled);
   $("start-owned").hidden=!enabled;
@@ -350,4 +352,142 @@ for(const name of Object.keys(controlLabels))$("loop-"+name).addEventListener("c
   finally{controlBusy=false;void refreshControl();if(epoch===sessionEpoch)void refreshLoop();}
 });
 setInterval(()=>{if(!document.hidden)void refreshControl();},5000);
+
+const orderStates = {
+  ready:"待派发", sending:"发出结果待确认", queued:"已派发", claimed:"已接单", running:"执行中",
+  unknown:"运行状态待核对", delegated:"管理员已分派", acknowledged:"已确认版号", reported:"执行者已交结果，待独立验收",
+  blocked:"受阻", decision:"待决定", unverified:"回执待核对", unrouted:"未派发", superseded:"新版已替换，未投递"
+};
+let displayedVersion=null, editingVersion=null, orderBusy=false, orderRead=0;
+let orderSignature="";
+const orderImages=new Set();
+function clearOrderImages(){
+  orderImages.forEach(src=>URL.revokeObjectURL(src));
+  orderImages.clear();
+}
+
+function clearOrder(){
+  ++orderRead;
+  displayedVersion=null; editingVersion=null; orderBusy=false;
+  orderSignature=""; clearOrderImages();
+  $("aams-order").hidden=true;
+  $("order-form").reset(); $("order-history").replaceChildren(); $("order-notice").textContent="";
+  $("order-status").textContent=""; $("order-submit").disabled=true;
+}
+function orderFormState(){
+  const stale = editingVersion!==null && editingVersion!==displayedVersion;
+  $("order-rebase").hidden=!stale;
+  $("order-submit").disabled=orderBusy || stale || displayedVersion===null;
+  $("order-instruction").disabled=orderBusy;
+  $("order-acceptance").disabled=orderBusy;
+  $("order-submit").textContent=displayedVersion?"发布改令":"下达首版指令";
+  $("order-next").textContent=stale?"编辑期间出现新版，请核对下方记录。":
+    (displayedVersion===null?"读取指令中":"将发布 v"+(displayedVersion+1));
+}
+function renderOrder(data){
+  $("aams-order").hidden=!data.enabled;
+  if(!data.enabled)return;
+  displayedVersion=data.latest;
+  const signature=JSON.stringify(data);
+  if(signature===orderSignature){orderFormState();return;}
+  orderSignature=signature; clearOrderImages();
+  $("order-status").textContent=data.latest?
+    "当前指令 v"+data.latest+" · "+(data.effective?"执行者已确认 v"+data.effective:"等待执行者确认版号"):"尚无主管指令";
+  const cards=data.orders.map(order=>{
+    const card=el("article","command");
+    card.append(el("h4","","v"+order.version+" · "+date(order.created)),
+      el("p","text",order.instruction),el("p","detail","验收条件　"+order.acceptance));
+    for(const leg of order.deliveries){
+      const ids=[leg.event_id && "事件 #"+leg.event_id,leg.run_id && "轮次 #"+leg.run_id].filter(Boolean).join(" · ");
+      card.append(el("p","result",leg.agent+" · "+(orderStates[leg.state]||leg.state)+(ids?" · "+ids:"")));
+      for(const detail of [leg.result,leg.evidence && "证据　"+leg.evidence,leg.note]){
+        if(detail)card.append(el("p","detail",detail));
+      }
+      if(leg.decision_run_id)card.append(el("p","detail","决策续办轮次 #"+leg.decision_run_id));
+      if(leg.role!=="manager" && ["reported","blocked"].includes(leg.state)){
+        const evidence=el("div","route-evidence");
+        card.append(evidence);
+        void displayEvidence(evidence,order.version,leg.run_id);
+      }
+      if(order.version===data.latest && leg===order.deliveries.at(-1) && leg.role!=="manager"
+          && ["acknowledged","blocked"].includes(leg.state)){
+        const follow=el("button","secondary","请原执行者补交同版实录");
+        follow.type="button"; card.append(follow);
+        follow.addEventListener("click",async()=>{
+          follow.disabled=true;
+          try{
+            await request("/api/aams/order/continue",{expected_version:order.version,after_run:leg.run_id});
+            await refreshOrder();
+          }catch(err){if(!obsolete(err))$("order-notice").textContent=err.message;}
+          finally{follow.disabled=false;}
+        });
+      }
+    }
+    return card;
+  });
+  $("order-history").replaceChildren(...cards);
+  orderFormState();
+}
+async function displayEvidence(container,version,run){
+  const query="/api/aams/evidence?version="+version+"&run="+run;
+  const epoch=sessionEpoch;
+  container.textContent="正在核对执行者引用的本机实录";
+  try{
+    const result=await request(query);
+    if(epoch!==sessionEpoch || !container.isConnected)return;
+    container.replaceChildren(el("p","detail",result.same_candidate?"两条路线的候选指纹一致，实录可查":"实录核对"));
+    for(const route of result.routes){
+      if(route.outcome==="missing"){container.append(el("p","detail",route.label+" · 缺少可核对的实录"));continue;}
+      const outcome=route.outcome==="completed"?"到达终点":"记录到首个卡点";
+      container.append(el("p","detail",route.label+" · "+outcome+" · "+route.detail+
+        " · "+route.keys+" 个按键边沿 · "+route.screenshots+" 张视口截图"),
+        el("p","detail","候选 SHA-256　"+route.candidate));
+      const button=el("button","secondary","查看"+route.label+"最后一帧");
+      container.append(button);
+      button.addEventListener("click",async()=>{
+        try{
+          const response=await fetch(query+"&frame="+route.route,{headers:{Authorization:"Bearer "+token},cache:"no-store"});
+          if(!response.ok)throw new Error("截图读取失败");
+          const blob=await response.blob();
+          if(epoch!==sessionEpoch||!button.isConnected)return;
+          const src=URL.createObjectURL(blob);orderImages.add(src);
+          const img=el("img","order-frame");img.src=src;img.alt=route.label+"的实机视口";button.replaceWith(img);
+        }catch(e){if(epoch===sessionEpoch)button.textContent=e.message;}
+      });
+    }
+    result.issues.forEach(issue=>container.append(el("p","detail",issue)));
+  }catch(e){if(!obsolete(e)&&epoch===sessionEpoch)container.textContent="实录尚未核对";}
+}
+async function refreshOrder(){
+  if(!token||orderBusy)return;
+  const seq=++orderRead;
+  try{
+    const data=await request("/api/aams/order");
+    if(seq===orderRead && !orderBusy)renderOrder(data);
+  }catch(e){
+    if(seq===orderRead && !obsolete(e)){
+      displayedVersion=null; orderFormState();
+      $("order-status").textContent="看板连接中断，请刷新核对当前指令。";
+    }
+  }
+}
+$("order-form").addEventListener("input",()=>{if(editingVersion===null)editingVersion=displayedVersion;});
+$("order-rebase").addEventListener("click",()=>{editingVersion=displayedVersion;orderFormState();});
+$("order-form").addEventListener("submit",async event=>{
+  event.preventDefault();
+  if($("order-submit").disabled)return;
+  const epoch=sessionEpoch;
+  orderBusy=true; ++orderRead; orderFormState();
+  try{
+    const result=await request("/api/aams/order",{
+      expected_version:editingVersion===null?displayedVersion:editingVersion,
+      instruction:$("order-instruction").value, acceptance:$("order-acceptance").value
+    });
+    if(epoch!==sessionEpoch)return;
+    $("order-notice").textContent="已记录 v"+result.version+"，接单状态见下方回执。";
+    $("order-form").reset(); editingVersion=null;
+  }catch(e){if(epoch===sessionEpoch)$("order-notice").textContent=e.message;}
+  finally{if(epoch===sessionEpoch){orderBusy=false;void refreshOrder();}}
+});
+setInterval(()=>{if(!document.hidden&&!$("dashboard").hidden)void refreshOrder();},3000);
 void connectOnStartup();
