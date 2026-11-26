@@ -100,6 +100,14 @@ class EvidenceLibrary:
         if self.root is None:
             errors.append("当前看板未配置本机试玩证据目录")
             return result
+        try:
+            manifest = contents(local_file(self.root.parent,"source-manifest.json"),4_000_000)
+            frozen_candidate = hashlib.sha256(manifest).hexdigest()
+            entries = json.loads(manifest.decode("utf-8-sig"))["files"]
+            frozen_story, = [v["sha256"] for v in entries if v["path"]=="previews/lv01_ch01/ch01_story_preview.gd"]
+        except (OSError,ValueError,KeyError,TypeError):
+            errors.append("缺少可核对的任务源文件清单")
+            return result
         for raw in re.split("[；;\n]", evidence or ""):
             if not raw.strip():
                 continue
@@ -118,6 +126,8 @@ class EvidenceLibrary:
                 story = invocation.get("story_script_sha256")
                 if not all(isinstance(sha,str) and re.fullmatch("[a-f0-9]{64}",sha) for sha in (candidate,story)):
                     raise ValueError("候选或鱼摊脚本指纹缺失")
+                if (candidate,story)!=(frozen_candidate,frozen_story):
+                    raise ValueError("运行所用候选或鱼摊脚本与本单源文件清单不符")
                 if invocation.get("arguments",[])[-2:] != [route,f"v{version}"]:
                     raise ValueError("启动记录的版号、路线不一致")
                 outcome = record.get("outcome")

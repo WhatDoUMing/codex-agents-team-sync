@@ -230,13 +230,33 @@ class OrdersTest(unittest.TestCase):
         self.f.finish(1,"DELEGATE tp-playtest")
         self.f.put("cards",4,{"run_id":1,"kind":"ask","state":"open","title":"怎么继续"})
         self.board.tick()
-        self.f.put("cards",4,{"run_id":1,"kind":"ask","state":"decided","answer_event":20})
+        card={"id":4,"run_id":1,"kind":"ask","state":"decided","answer_event":20,
+              "rule":aams.ROLES["manager"][1],"agent":"tp-manager","source":"local","lane":"test-lane"}
+        self.f.put("cards",4,card)
+        self.f.put("events",20,{"id":20,"key":"card:4:1","source":"local","type":"card.answered",
+            "subject":"test-lane","routed":json.dumps([aams.ROLES["manager"][1]])})
         self.board.tick()
         self.assertEqual(self.board.view()["orders"][0]["deliveries"][0]["state"],"decision")
         self.f.put("run_events","9:20",{"event_id":20,"run_id":9})
+        receipt="AAMS/1 "+self.f.sent[0]["id"]+" DELEGATE tp-playtest"
+        finished="2026-11-26T10:42:00Z"
         self.f.put("runs",9,{"id":9,"state":"done","rule":aams.ROLES["manager"][1],"agent":"tp-manager",
             "rules_version":1,"claimed_at":"2026-11-26T10:40:00Z","finished_at":"2026-11-26T10:42:00Z",
-            "summary":"AAMS/1 "+self.f.sent[0]["id"]+" DELEGATE tp-playtest"})
+            "summary":receipt})
+        # Loop atomically closes the answered ask in the same official finish operation.
+        self.f.put("cards",4,{**card,"state":"done","closed_at":finished,"result":receipt})
         self.board.tick()
         first=self.board.view()["orders"][0]["deliveries"][0]
         self.assertEqual((first["state"],first["run_id"],first["decision_run_id"]),("delegated",1,9))
+
+    def test_foreign_answer_event_cannot_release_a_done_card(self):
+        self.f.issue(1)
+        self.board.tick()
+        self.f.finish(1,"DELEGATE tp-playtest")
+        self.f.put("cards",4,{"id":4,"run_id":1,"kind":"ask","state":"done","answer_event":20,
+            "rule":aams.ROLES["manager"][1],"agent":"tp-manager","source":"local","lane":"test-lane"})
+        self.f.put("events",20,{"id":20,"key":"card:99","source":"local","type":"card.answered",
+            "subject":"test-lane","routed":json.dumps([aams.ROLES["manager"][1]])})
+        self.board.tick()
+        self.assertEqual(self.board.view()["orders"][0]["deliveries"][0]["state"],"unverified")
+        self.assertEqual(len(self.f.sent),1)

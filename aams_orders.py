@@ -3,6 +3,7 @@ from contextlib import closing
 import http.client
 import json
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 from threading import Event, Lock, Thread
@@ -159,8 +160,18 @@ class LocalLoop:
                     observed.update(state="decision", result=str(asks[0].get("title") or "该轮有待处理的决策卡"))
                     # An answer has its own Loop event and run. The old pre-decision summary cannot
                     # authorize a handoff. Poll the actual follow-up receipt against the original binding.
-                    if len(asks)==1 and asks[0].get("state") in ("decided","closed") and asks[0].get("answer_event"):
-                        answered = asks[0]["answer_event"]
+                    if len(asks)==1 and asks[0].get("state") in ("decided","done") and asks[0].get("answer_event"):
+                        card = asks[0]
+                        answered = card["answer_event"]
+                        answers = records("events","key=?",[str(answered)])
+                        answer = answers[0] if len(answers)==1 else {}
+                        if (card.get("source")!="local" or card.get("agent")!=agent or card.get("rule")!=rule
+                                or type(card.get("id")) is not int or type(answered) is not int
+                                or answer.get("id")!=answered or answer.get("source")!="local" or answer.get("sent")
+                                or answer.get("type")!="card.answered" or answer.get("subject")!=(card.get("lane") or "")
+                                or not re.fullmatch(rf"card:{card['id']}(?::[1-9]\d*)?",answer.get("key") or "")
+                                or json.loads(answer.get("routed") or "[]") != [rule]):
+                            raise Conflict("决策卡与实际 Loop 答复事件不匹配")
                         answer_links = records("run_events", "json_extract(data,'$.event_id')=?", [answered])
                         observed["result"] = "决策已答复，等待续办轮次回执"
                         if len(answer_links)==1:
@@ -171,9 +182,12 @@ class LocalLoop:
                             configs = records("config", "key=?", [str(follow.get("rules_version"))])
                             who = configs[0]["value"].get("agents",{}).get(agent,{}) if len(configs)==1 else {}
                             fresh_asks = records("cards","json_extract(data,'$.run_id')=? AND json_extract(data,'$.kind')='ask'",[follow_id])
-                            if (len(members)==1 and follow.get("rule")==rule and follow.get("agent")==agent and
+                            if (card["state"]=="done" and type(follow_id) is int and follow_id!=run_id
+                                    and len(members)==1 and members[0].get("event_id")==answered
+                                    and follow.get("id")==follow_id and follow.get("rule")==rule and follow.get("agent")==agent and
                                     who.get("worker")==local_worker and who.get("use")==self.backend and not fresh_asks and
-                                    follow.get("state")=="done" and follow.get("claimed_at") and follow.get("finished_at")):
+                                    follow.get("state")=="done" and follow.get("claimed_at") and follow.get("finished_at")
+                                    and card.get("closed_at")==follow["finished_at"] and card.get("result")==follow.get("summary")):
                                 observed["decision_run_id"] = follow_id
                                 try:
                                     status, result, evidence = parse_receipt(row, follow.get("summary"))

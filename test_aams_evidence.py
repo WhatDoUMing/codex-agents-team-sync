@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -20,14 +21,17 @@ class EvidenceTests(unittest.TestCase):
         self.root=Path(self.tmp.name)/"qa_runs"
         self.root.mkdir()
         self.library=EvidenceLibrary(self.root)
+        manifest=json.dumps({"files":[{"path":"previews/lv01_ch01/ch01_story_preview.gd","sha256":"b"*64}]}).encode()
+        (self.root.parent/"source-manifest.json").write_bytes(manifest)
+        self.candidate=hashlib.sha256(manifest).hexdigest()
         self.image=(b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">IIBBBBB",1,1,8,2,0,0,0))+
                     chunk(b"IDAT",zlib.compress(b"\0\0\0\0"))+chunk(b"IEND",b""))
 
-    def route(self,name,version=2,sha="a"*64):
+    def route(self,name,version=2,sha=None):
         directory=self.root/name
         directory.mkdir()
         def write(file,value):(directory/file).write_text(json.dumps(value),encoding="utf-8")
-        write("invocation.json",{"source_manifest_sha256":sha,"story_script_sha256":"b"*64,"engine_exit_code":2,
+        write("invocation.json",{"source_manifest_sha256":sha or self.candidate,"story_script_sha256":"b"*64,"engine_exit_code":2,
                                  "arguments":["--",str(directory),name,"v"+str(version)]})
         write("summary.json",{"route":name,"instruction_version":"v"+str(version),"screenshots":["last.png"],
                               "capture_errors":[],"key_events_sent":1,"key_events_observed":1,"external_key_events":0,
