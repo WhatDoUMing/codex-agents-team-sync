@@ -1,6 +1,7 @@
 """Local, multi-project team progress sync. Python standard library only."""
 import argparse
 from contextlib import contextmanager
+from getpass import getpass, GetPassWarning
 import hmac
 import json
 import math
@@ -12,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data" / "sync.sqlite3"
@@ -145,6 +147,21 @@ def _fresh_active(row, now=None):
     now = time.time() if now is None else now
     age = now - number(row["updated"])
     return row["status"] in ACTIVE and -5 <= age <= STALE_AFTER
+
+
+def opt_in(path, worker, generation, project="default"):
+    """Enable the registered owner's inbox without changing their run or history."""
+    if not isinstance(generation, str) or not generation or not generation.isascii():
+        raise ValueError("existing worker generation required")
+    with connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = _target(db, worker, generation, project)
+        if row["is_demo"] or row["status"] not in ACTIVE:
+            raise ValueError("only an existing active non-demo worker can enable cooperation")
+        changed = db.execute("""UPDATE workers SET cooperative=1
+            WHERE id=? AND project=? AND generation=? AND cooperative=0""",
+            (worker, project, generation)).rowcount
+    return {"id": worker, "project": project, "cooperative": True, "changed": bool(changed)}
 
 
 def heartbeat(path, worker, generation, status, detail, project="default"):
@@ -501,6 +518,28 @@ class DemoManager:
             thread.join(timeout=7)
 
 
+def _cli_generation(args):
+    existing = getattr(args, "generation", None)
+    if existing is not None:
+        if args.generation_stdin:
+            raise ValueError("choose one generation input")
+        return existing
+    if args.generation_stdin:
+        if sys.stdin.isatty():
+            raise ValueError("use the hidden prompt for interactive input")
+        value = sys.stdin.readline(129).rstrip("\r\n")
+    else:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", GetPassWarning)
+                value = getpass("Existing worker generation: ")
+        except (EOFError, GetPassWarning) as exc:
+            raise ValueError("hidden input unavailable; supply generation on stdin") from exc
+    if not value or len(value) > 128:
+        raise ValueError("existing worker generation required")
+    return value
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help="independent writable sync DB")
@@ -516,9 +555,13 @@ def parser():
     for name in ("team", "role", "task"):
         r.add_argument("--" + name, required=True)
     r.add_argument("--cooperative", action="store_true", help="declare inbox support; not proof of a consumer")
+    opt = sub.add_parser("opt-in", help="enable the existing owner's inbox without registering a new run")
+    opt.add_argument("worker")
+    opt.add_argument("--generation-stdin", action="store_true", help="read the existing generation from a pipe")
     h = sub.add_parser("heartbeat")
     h.add_argument("worker")
-    h.add_argument("generation")
+    h.add_argument("generation", nargs="?")
+    h.add_argument("--generation-stdin", action="store_true")
     h.add_argument("--status", required=True, choices=sorted(STATUSES))
     h.add_argument("--detail", required=True)
     q = sub.add_parser("send")
@@ -527,7 +570,8 @@ def parser():
     q.add_argument("--id")
     i = sub.add_parser("inbox")
     i.add_argument("worker")
-    i.add_argument("generation")
+    i.add_argument("generation", nargs="?")
+    i.add_argument("--generation-stdin", action="store_true")
     c = sub.add_parser("claim")
     c.add_argument("worker")
     c.add_argument("generation")
@@ -583,12 +627,14 @@ def main(argv=None):
             out = snapshot(args.db, args.source, args.project)
         elif args.op == "register":
             out = register(args.db, args.worker, args.team, args.role, args.task, args.cooperative, project)
+        elif args.op == "opt-in":
+            out = opt_in(args.db, args.worker, _cli_generation(args), project)
         elif args.op == "heartbeat":
-            out = heartbeat(args.db, args.worker, args.generation, args.status, args.detail, project)
+            out = heartbeat(args.db, args.worker, _cli_generation(args), args.status, args.detail, project)
         elif args.op == "send":
             out = queue(args.db, args.worker, args.text, args.id, project)
         elif args.op == "inbox":
-            out = inbox(args.db, args.worker, args.generation, project)
+            out = inbox(args.db, args.worker, _cli_generation(args), project)
         elif args.op == "claim":
             out = claim(args.db, args.worker, args.generation, args.command, args.claimant, project)
         elif args.op == "ack":

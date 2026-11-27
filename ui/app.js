@@ -563,6 +563,97 @@ const workspaceDeliveryStates = {
   unrouted: "未送达", reconciling: "旧版对账中", superseded: "已被新版替代",
 };
 
+const workerCommandStates = {
+  queued: "已排队", acknowledged: "已领取", completed: "已回报", rejected: "已拒绝",
+};
+
+function workerReport(detail) {
+  if (typeof detail !== "string" || !detail.trimStart().startsWith("{")) return {detail};
+  try {
+    const report = JSON.parse(detail);
+    const modelField = value => typeof value === "string" && /^[a-z0-9_.-]{1,90}$/i.test(value);
+    if (typeof report.detail === "string" && modelField(report.model) && modelField(report.effort)) {
+      return {detail: report.detail, model: report.model, effort: report.effort};
+    }
+  } catch {
+    // The native heartbeat accepts ordinary text as well.
+  }
+  return {detail};
+}
+
+function latestWorkerCommand(commands, field) {
+  return commands.reduce((latest, command) =>
+    Number.isFinite(command[field]) && (!latest || command[field] > latest[field]) ? command : latest, null);
+}
+
+function attachWorkspaceWorkers(project, snapshot) {
+  if (!Array.isArray(snapshot?.workers) || !Array.isArray(snapshot?.commands)) snapshot = null;
+  const memberships = new Map();
+  const loopActors = new Set();
+  for (const department of project.departments) {
+    for (const employee of department.employees) {
+      if (!memberships.has(employee.id)) memberships.set(employee.id, new Set());
+      memberships.get(employee.id).add(department.id);
+      if (employee.channel === "loop") loopActors.add(employee.id);
+    }
+  }
+  const reports = new Map((snapshot?.workers || []).filter(worker =>
+    worker.project === project.id && !worker.is_demo && !worker.native &&
+    ["manual-report", "declared-cooperative"].includes(worker.source)).map(worker => [worker.id, worker]));
+  const commands = new Map();
+  for (const command of snapshot?.commands || []) {
+    if (command.project !== project.id || !reports.has(command.worker) || command.native_delivery) continue;
+    if (!commands.has(command.worker)) commands.set(command.worker, []);
+    commands.get(command.worker).push(command);
+  }
+  for (const department of project.departments) {
+    for (const employee of department.employees) {
+      const worker = reports.get(employee.id);
+      if (memberships.get(employee.id).size > 1 && worker?.team !== department.id) {
+        employee.manual = null;
+        continue;
+      }
+      if (!worker) continue;
+      const personal = commands.get(worker.id) || [];
+      const acknowledged = personal.filter(command => Boolean(command.claimant) &&
+        ["acknowledged", "completed", "rejected"].includes(command.state));
+      const returned = acknowledged.filter(command => ["completed", "rejected"].includes(command.state));
+      const pollAge = snapshot.observed_at - worker.last_polled;
+      const currentConsumer = worker.source === "declared-cooperative" && Boolean(worker.cooperative) &&
+        worker.can_queue === true && worker.freshness === "fresh" && worker.inbox_observed === true &&
+        Number.isFinite(worker.last_polled) && Number.isFinite(snapshot.stale_after_seconds) &&
+        pollAge >= -5 && pollAge <= snapshot.stale_after_seconds;
+      employee.worker = {
+        task: worker.task, status: worker.status, freshness: worker.freshness, source: worker.source,
+        updated: worker.updated, last_polled: worker.last_polled, currentConsumer, loopActor: loopActors.has(worker.id),
+        ...workerReport(worker.detail),
+        latest: latestWorkerCommand(personal, "created"),
+        claimed: latestWorkerCommand(acknowledged, "claimed"),
+        returned: latestWorkerCommand(returned, "completed"),
+      };
+    }
+  }
+}
+
+function canCorrectWorker(project, department, employee) {
+  return employee.channel === "observe" && !project.delegations_paused && !department.paused && !department.delegation_only &&
+    employee.worker?.currentConsumer === true && !employee.worker.loopActor;
+}
+
+async function readWorkspaceProject(projectId) {
+  const query = new URLSearchParams({project: projectId});
+  const [project, snapshot] = await Promise.all([
+    request("/api/aams/project?" + query),
+    request("/api/snapshot?" + query).catch(error => {
+      if (obsolete(error)) throw error;
+      return null;
+    }),
+  ]);
+  if (project.id !== projectId || !Array.isArray(project.departments)) throw new Error("项目数据无效");
+  attachWorkspaceWorkers(project, snapshot);
+  return {project, snapshot};
+}
+
 function workspaceButton(text, onClick, className = "secondary") {
   const button = el("button", className, text);
   button.type = "button";
@@ -642,9 +733,8 @@ async function refreshWorkspaceProject(force = false) {
   const projectId = workspace.projectId;
   workspace.loading = true;
   try {
-    const data = await request("/api/aams/project?" + new URLSearchParams({project: projectId}));
+    const {project: data} = await readWorkspaceProject(projectId);
     if (revision !== workspace.revision || sequence !== workspace.sequence) return;
-    if (data.id !== projectId || !Array.isArray(data.departments)) throw new Error("项目数据无效");
     const fingerprint = JSON.stringify(data);
     if (fingerprint !== workspace.fingerprint) {
       renderWorkspaceProject(data);
@@ -761,10 +851,12 @@ function renderDelegation(project, delegation, open) {
 }
 
 function departmentPresence(department) {
-  const presence = department.paused ? "已暂停派发" : (workspaceAgentStates[department.status] || "待确认");
+  const fresh = department.employees.filter(employee => employee.worker?.freshness === "fresh").length;
+  const presence = department.paused ? "已暂停派发" :
+    fresh && department.status === "observing" ? "" : (workspaceAgentStates[department.status] || "待确认");
   const review = Number.isInteger(department.pending_review) && department.pending_review > 0
     ? department.pending_review + " 项待验收" : department.pending_review === true ? "待验收" : "";
-  return [presence, review].filter(Boolean).join(" · ");
+  return [presence, fresh ? fresh + " 人心跳有效" : "", review].filter(Boolean).join(" · ");
 }
 
 function renderDepartmentSummary(department) {
@@ -870,11 +962,34 @@ function receiptFact(label, text, confirmed, instant) {
   return column;
 }
 
+function renderWorkerReceipts(receipts, worker) {
+  const latest = worker.latest;
+  const claimed = Boolean(latest?.claimant) && ["acknowledged", "completed", "rejected"].includes(latest.state);
+  const returned = claimed && ["completed", "rejected"].includes(latest.state);
+  const inbox = worker.source !== "declared-cooperative" ? "仅观察" : worker.currentConsumer ? "近期轮询" : "待轮询";
+  receipts.append(
+    receiptFact("最新指令", workerCommandStates[latest?.state] || "暂无", Boolean(latest), workerInstant(latest?.created)),
+    receiptFact("收件箱", inbox, worker.currentConsumer, workerInstant(worker.last_polled)),
+    receiptFact("本次领取", claimed ? "已领取" : "待领取", claimed, claimed ? workerInstant(latest.claimed) : null),
+    receiptFact("本次回报", returned ? workerCommandStates[latest.state] : "待回报",
+      returned, returned ? workerInstant(latest.completed) : null),
+  );
+}
+
+function workerInstant(value) {
+  if (!Number.isFinite(value)) return null;
+  const instant = new Date(value * 1000);
+  return Number.isFinite(instant.getTime()) ? instant.toISOString() : null;
+}
+
 function renderEmployee(project, department, employee, detailOpen) {
   const card = el("article", "employee-card");
   card.dataset.employee = employee.id;
   const current = employee.last_delivery;
   const history = employee.history;
+  const worker = employee.worker;
+  const local = employee.channel === "observe" && worker;
+  const observedModel = employee.model_source?.startsWith("Codex 当前轮 turn_context");
   const heading = el("div", "employee-heading");
   const name = el("h4", "", employee.name);
   if (employee.lead) name.append(el("span", "employee-role", "负责人"));
@@ -882,31 +997,43 @@ function renderEmployee(project, department, employee, detailOpen) {
   const task = el("p", "work-title", employee.task?.title || "暂无当前工作");
   if (employee.task) task.append(el("span", "employee-role work-version", "v" + employee.task.version));
   const facts = el("dl", "employee-facts");
-  const workState = current ? workspaceDeliveryStates[current.state]
-    : history ? loopStates[history.state] : employee.manual ? states[employee.manual.status] : employee.task ? "已登记" : "待分配";
+  const workState = current ? workspaceDeliveryStates[current.state] : history ? loopStates[history.state]
+    : local || employee.manual ? states[(local || employee.manual).status] : employee.task ? "已登记" : "待分配";
   appendFact(facts, "工作状态", workState || "待确认");
-  appendFact(facts, "模型", employee.model_source && employee.model ? employee.model : "待核实");
-  appendFact(facts, "思考级别", employee.model_source && employee.effort ? employee.effort : "待核实");
+  if (worker) {
+    appendFact(facts, "本人任务", worker.task);
+    appendFact(facts, "最近心跳", date(worker.updated));
+  }
+  appendFact(facts, "模型", observedModel && employee.model ? employee.model :
+    local?.model ? local.model + "（本人自报）" : "待核实");
+  appendFact(facts, "思考级别", observedModel && employee.effort ? employee.effort :
+    local?.effort ? local.effort + "（本人自报）" : "待核实");
   const receipts = el("div", "work-receipts");
   const claimed = current?.claimed_at || history?.claimed_at;
   const applied = current?.applied_at;
   const hasResult = current ? current.state === "reported" && Boolean(current.result)
     : Boolean(history?.finished_at && history.result);
   const hasBlocker = current?.state === "blocked";
-  receipts.append(
-    receiptFact("保存", employee.task ? "已保存" : "待登记", Boolean(employee.task)),
-    receiptFact("接收", claimed ? "已接收" : "待确认", Boolean(claimed), claimed),
-    receiptFact("生效", applied ? "已生效" : "待确认", Boolean(applied), applied),
-    receiptFact("结果", hasBlocker ? "有卡点" : hasResult ? "有结果" : "待结果", hasResult,
-      hasResult || hasBlocker ? current?.finished_at || history?.finished_at : null),
-  );
+  if (local) {
+    renderWorkerReceipts(receipts, local);
+  } else {
+    receipts.append(
+      receiptFact("保存", employee.task ? "已保存" : "待登记", Boolean(employee.task)),
+      receiptFact("接收", claimed ? "已接收" : "待确认", Boolean(claimed), claimed),
+      receiptFact("生效", applied ? "已生效" : "待确认", Boolean(applied), applied),
+      receiptFact("结果", hasBlocker ? "有卡点" : hasResult ? "有结果" : "待结果", hasResult,
+        hasResult || hasBlocker ? current?.finished_at || history?.finished_at : null),
+    );
+  }
   card.append(heading, task, facts, receipts);
 
   if (employee.task && !department.delegation_only) {
-    const correct = workspaceButton("纠正此 Agent", () => editWorkspaceChange(project, department, employee));
+    const loop = employee.channel === "loop";
+    const correct = workspaceButton("纠正此 Agent", () => loop
+      ? editWorkspaceChange(project, department, employee) : editWorkspaceWorker(project, department, employee));
     correct.dataset.workspaceAction = department.id + ":" + employee.id + ":correct";
-    correct.disabled = !employee.can_correct || employee.channel !== "loop";
-    if (correct.disabled) correct.title = employee.channel === "observe" ? "观察员工暂未接入派发" : "当前工作暂不能接收纠正";
+    correct.disabled = loop ? !employee.can_correct : !canCorrectWorker(project, department, employee);
+    if (correct.disabled) correct.title = loop ? "当前工作暂不能接收纠正" : "等待本人最新心跳和收件箱轮询";
     card.append(correct);
   }
   card.append(renderEmployeeDetails(project, department, employee, detailOpen));
@@ -920,8 +1047,9 @@ function renderEmployeeDetails(project, department, employee, open) {
   const facts = el("dl", "employee-facts");
   const current = employee.last_delivery;
   const historical = employee.history;
+  const worker = employee.worker;
   appendFact(facts, "归属", project.name + " / " + department.name);
-  appendFact(facts, "在岗", employee.channel === "observe" ? "仅观察"
+  appendFact(facts, "在岗", employee.channel === "observe" ? states[worker?.status] || "仅观察"
     : employee.status === "unknown" ? "在线情况未知" : workspaceAgentStates[employee.status] || "在线情况未知");
   if (employee.model_source) appendFact(facts, "模型来源", employee.model_source);
   if (current) {
@@ -937,7 +1065,27 @@ function renderEmployeeDetails(project, department, employee, open) {
     if (historical.finished_at) appendFact(facts, "结束时间", new Date(historical.finished_at).toLocaleString("zh-CN"));
     if (historical.result) appendFact(facts, "历史结果", historical.result);
   }
-  if (employee.manual) {
+  if (worker) {
+    appendFact(facts, "登记任务", employee.task.id);
+    appendFact(facts, "心跳来源", worker.source === "declared-cooperative" ? "本人协作登记" : "本地本人自报");
+    if (worker.detail) appendFact(facts, "自报说明", worker.detail);
+    if (employee.channel === "loop" && worker.model) {
+      appendFact(facts, "本人自报模型", worker.model + " / " + worker.effort);
+    }
+    if (worker.last_polled) appendFact(facts, "最近轮询", date(worker.last_polled));
+    if (worker.latest) {
+      appendFact(facts, "本次指令", worker.latest.id + " · " + workerCommandStates[worker.latest.state]);
+    }
+    if (worker.claimed) {
+      const label = worker.claimed.id === worker.latest?.id ? "本次领取" : "上次领取";
+      appendFact(facts, label, worker.claimed.id + " · " + worker.claimed.claimant + " · " + date(worker.claimed.claimed));
+    }
+    if (worker.returned) {
+      const label = worker.returned.id === worker.latest?.id ? "本次回报" : "上次回报";
+      appendFact(facts, label, worker.returned.id + " · " + date(worker.returned.completed));
+      appendFact(facts, "回报内容", worker.returned.result);
+    }
+  } else if (employee.manual) {
     appendFact(facts, "自报时间", date(employee.manual.updated));
     if (employee.manual.detail) appendFact(facts, "自报说明", employee.manual.detail);
   }
@@ -1133,6 +1281,35 @@ function editWorkspaceChange(project, department, employee = null) {
     }),
     done: data => {
       workspaceMessage("已登记 v" + data.version + "，接收与生效以回执为准。");
+      void refreshWorkspaceProject(true);
+    },
+  });
+}
+
+function editWorkspaceWorker(project, department, employee) {
+  showWorkspaceDialog("纠正此 Agent", {
+    kind: "worker",
+    context: [project.name, department.name, employee.name, employee.task.title, "本人任务 · " + employee.worker.task].join(" / "),
+    fields: [{name: "instruction", label: "纠正指令", multiline: true},
+      {name: "acceptance", label: "验收条件", multiline: true}],
+    submitText: "提交指令",
+    send: async (values, commandId) => {
+      const {project: current, snapshot} = await readWorkspaceProject(project.id);
+      const targetDepartment = current.departments.find(item => item.id === department.id);
+      const target = targetDepartment?.employees.find(item => item.id === employee.id);
+      const text = values.instruction + "\n\n验收条件\n" + values.acceptance;
+      const previous = snapshot?.commands?.find(command => command.id === commandId &&
+        command.project === project.id && command.worker === employee.id && command.text === text);
+      if (previous) return previous;
+      if (workspace.projectId !== project.id || workspace.departmentId !== department.id ||
+          !target || target.task?.id !== employee.task.id || !canCorrectWorker(current, targetDepartment, target) ||
+          target.worker.task !== employee.worker.task) {
+        throw new Error("岗位或收件箱状态已变化，请核对当前员工卡。");
+      }
+      return request("/api/commands", {project: project.id, worker: employee.id, text, command_id: commandId});
+    },
+    done: () => {
+      workspaceMessage("已加入本人收件箱，领取和回报在员工卡查看。");
       void refreshWorkspaceProject(true);
     },
   });

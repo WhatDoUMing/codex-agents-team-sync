@@ -82,6 +82,52 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sync.queue(self.path, item["id"], "bad target project", project="beta")
 
+    def test_opt_in_updates_only_cooperative_and_preserves_the_existing_run(self):
+        item = self.register()
+        owner = item["generation"]
+        sync.queue(self.path,"worker-1","preserve this receipt","old-command","alpha")
+        claim = sync.claim(self.path,"worker-1",owner,"old-command","worker-1","alpha")
+        sync.ack(self.path,"worker-1",owner,"old-command","completed","old result",
+                 "worker-1",claim["claim_token"],"alpha")
+        sync.queue(self.path,"worker-1","preserve this queue entry","old-pending","alpha")
+        with sync.connect(self.path) as db:
+            db.execute("UPDATE workers SET cooperative=0,updated=0 WHERE id='worker-1'")
+        with sync.connect(self.path,readonly=True) as db:
+            before = dict(db.execute("SELECT * FROM workers WHERE id='worker-1'").fetchone())
+            schema = db.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall()
+        old_commands = sync.command_list(self.path,"alpha")
+        for generation, project in ((None,"alpha"),("wrong","alpha"),(owner,"beta")):
+            with self.assertRaises(ValueError):
+                sync.opt_in(self.path,"worker-1",generation,project)
+        result = sync.opt_in(self.path,"worker-1",owner,"alpha")
+        self.assertEqual(result,{"id":"worker-1","project":"alpha","cooperative":True,"changed":True})
+        self.assertFalse(sync.opt_in(self.path,"worker-1",owner,"alpha")["changed"])
+        with sync.connect(self.path,readonly=True) as db:
+            self.assertEqual(dict(db.execute("SELECT * FROM workers WHERE id='worker-1'").fetchone()),
+                             {**before,"cooperative":1})
+            self.assertEqual(db.execute("SELECT name,sql FROM sqlite_master ORDER BY name").fetchall(),schema)
+        self.assertEqual(sync.command_list(self.path,"alpha"),old_commands)
+        self.assertFalse(sync.workers(self.path,project="alpha")[0]["can_queue"])
+        sync.heartbeat(self.path,"worker-1",owner,"running","same owner resumed","alpha")
+        self.assertEqual([cmd["id"] for cmd in sync.inbox(self.path,"worker-1",owner,"alpha")],["old-pending"])
+
+    def test_opt_in_rejects_demo_and_terminal_workers_and_cli_keeps_generation_private(self):
+        demo = sync.register(self.path,"demo-1","team-A","tester","demo task",False,"alpha",is_demo=True)
+        done = self.register("done-worker",cooperative=False)
+        sync.heartbeat(self.path,done["id"],done["generation"],"completed","done","alpha")
+        for item in (demo,done):
+            with self.assertRaises(ValueError):
+                sync.opt_in(self.path,item["id"],item["generation"],"alpha")
+        item = self.register(cooperative=False)
+        prefix = [sys.executable,"-B",str(Path(sync.__file__)),"--db",str(self.path),"--project","alpha"]
+        for command in (["opt-in","worker-1"],["heartbeat","worker-1","--status","running","--detail","owner beat"],
+                        ["inbox","worker-1"]):
+            child = subprocess.run([*prefix,*command,"--generation-stdin"], input=item["generation"]+"\n",
+                                   text=True,capture_output=True,timeout=10)
+            self.assertEqual(child.returncode,0,child.stderr)
+            self.assertNotIn(item["generation"],child.stdout+child.stderr)
+        self.assertTrue(sync.workers(self.path,project="alpha")[-1]["inbox_observed"])
+
     def test_projects_filter_reports_and_commands(self):
         self.register()
         self.register("worker-2", "beta")

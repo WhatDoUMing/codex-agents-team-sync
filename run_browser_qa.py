@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -16,13 +17,55 @@ from test_aams_projects import ProjectFixture, manifest
 from test_sync import make_legacy
 
 
+CARD_PROJECT = "native-cards"
+CARD_ACTOR = "card-owner"
+CARD_PHASE = "card-consumer-phase.txt"
+CARD_CONSUMER = """
+import json
+from pathlib import Path
+import sys
+import time
+import sync
+
+settings = json.load(sys.stdin)
+db, control = Path(settings["db"]), Path(settings["control"])
+project, worker, generation = settings["project"], settings["id"], settings["generation"]
+sync.opt_in(db, worker, generation, project)
+detail = json.dumps({"detail": "Independent fixture heartbeat", "model": "qa-self-reported", "effort": "max"})
+claimed = None
+previous = None
+while True:
+    phase = control.read_text(encoding="ascii").strip()
+    if phase == "stop":
+        break
+    if phase == "offline":
+        if previous != phase:
+            with sync.connect(db) as connection:
+                expired = time.time() - 61
+                connection.execute("UPDATE workers SET updated=?,last_polled=? WHERE project=? AND id=? AND generation=?",
+                                   (expired, expired, project, worker, generation))
+    else:
+        sync.heartbeat(db, worker, generation, "running", detail, project)
+        queued = sync.inbox(db, worker, generation, project)
+        if phase == "claim" and claimed is None and queued:
+            claimed = sync.claim(db, worker, generation, queued[0]["id"], worker, project)
+        if phase == "report" and claimed is not None:
+            sync.ack(db, worker, generation, claimed["id"], "completed", "Independent consumer recorded the fixture status",
+                     worker, claimed["claim_token"], project)
+            claimed = None
+    previous = phase
+    time.sleep(.3)
+"""
+
+
 class BrowserProjectFixture(ProjectFixture):
     """Supply captured-format receipts in a disposable Hub ledger, with no external requests."""
 
     roles = {**ProjectFixture.roles,
              "test.browser-project": ("浏览器项目经理", "qa-manager"),
              "test.browser-lead": ("浏览器交付负责人", "qa-lead"),
-             "test.browser-result": ("浏览器交付员工", "qa-worker")}
+             "test.browser-result": ("浏览器交付员工", "qa-worker"),
+             "test.browser-live-formal": ("浏览器正式员工", "card-formal")}
 
     def __init__(self, root):
         root.mkdir()
@@ -74,6 +117,9 @@ class BrowserProjectFixture(ProjectFixture):
             }), encoding="utf-8")
             if data["instruction"] == "浏览器 QA 记录卡点":
                 self.finish(event, "BLOCKED | 跳转入口不可用（隔离样例） | " + reference)
+            elif body["type"] == "test.browser-live-formal":
+                self.finish(event, "APPLIED_RESULT | 正式 Loop 隔离核对 | " + reference,
+                            session=self.runtime("qa-loop-turn-model", "xhigh"))
             elif data["scope"] == "person" and not data.get("continuation"):
                 self.finish(event, "APPLIED | QA 已接收当前工作 | " + reference,
                             session=self.runtime("qa-first-model", "max"))
@@ -99,6 +145,52 @@ class BrowserProjectFixture(ProjectFixture):
                            "task_title": "核对候选数值", "event_type": "test.browser-result", "rule": "浏览器交付员工"}],
         })
         return result
+
+
+def live_card_fixture(board, db, directory):
+    roles = {
+        CARD_ACTOR: "本人原有任务",
+        "card-observer": "只观察岗位",
+        "card-unpolled": "声明后未轮询",
+        "card-formal": "正式 Loop 并有本人自报",
+        "card-ambiguous": "无匹配部门的协作岗",
+        "card-foreign": "另一项目同名岗位",
+        "card-demo": "协议演示",
+    }
+    employees = [{"id": worker, "name": name, "task_id": "registered-" + worker,
+                  "task_title": "岗位登记工作 " + name} for worker, name in roles.items()]
+    for member in employees:
+        if member["id"] == "card-formal":
+            member.update(event_type="test.browser-live-formal", rule="浏览器正式员工")
+    board.configure({"project": {"id": CARD_PROJECT, "name": "员工卡验收",
+        "manager": {"id": "qa-manager", "event_type": "test.browser-project", "rule": "浏览器项目经理"}},
+        "departments": [
+            {"id": "collaboration", "name": "协作部门", "lead": "card-lead",
+             "mainline": "核对普通员工卡", "employees": employees},
+            {"id": "backup-collaboration", "name": "协作观察", "lead": "card-backup-lead",
+             "mainline": "核对正式岗位的观察卡", "employees": [
+                 {"id": "card-formal", "name": "正式岗位观察卡", "task_id": "observe-card-formal",
+                  "task_title": "观察正式岗位回执"},
+                 {"id": "card-ambiguous", "name": "另一登记卡", "task_id": "observe-card-ambiguous",
+                  "task_title": "只查看明确的部门登记"}]},
+        ]})
+    owner = sync.register(db,CARD_ACTOR,"collaboration","owner","来自本人的实际任务描述",False,CARD_PROJECT)
+    for worker in roles.keys() - {CARD_ACTOR}:
+        project = "other-cards" if worker == "card-foreign" else CARD_PROJECT
+        team = "unmapped-team" if worker == "card-ambiguous" else "collaboration"
+        item = sync.register(db,worker,team,"fixture","Self-report " + worker,worker != "card-observer",
+                             project,is_demo=worker == "card-demo")
+        sync.heartbeat(db,worker,item["generation"],"running",json.dumps(
+            {"detail":"Explicit fixture self-report","model":"qa-self-reported","effort":"max"}),project)
+        if worker in ("card-formal","card-foreign","card-demo","card-ambiguous"):
+            sync.inbox(db,worker,item["generation"],project)
+    control = directory / CARD_PHASE
+    control.write_text("poll",encoding="ascii")
+    child = subprocess.Popen([sys.executable,"-B","-c",CARD_CONSUMER],cwd=sync.ROOT,stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL,encoding="utf-8")
+    with child.stdin as stream:
+        json.dump({"db":str(db),"control":str(control),**owner},stream)
+    return control, child
 
 
 def main():
@@ -141,6 +233,7 @@ def main():
         server = web_server.create_server(db, port=0, open_browser=True, order_loop=LocalLoop(root),
                                           project_loop=project_fixture.loop, project_evidence_root=root)
         server.projects.configure(project_fixture.roster())
+        card_control, card_consumer = live_card_fixture(server.projects,db,root)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         env = {**os.environ, "TEAM_SYNC_QA_URL": "http://127.0.0.1:%d/" % server.server_address[1],
@@ -150,6 +243,12 @@ def main():
             result = subprocess.run(["node", str(sync.ROOT/"browser_qa.js")], env=env, timeout=120)
             return result.returncode
         finally:
+            card_control.write_text("stop",encoding="ascii")
+            try:
+                card_consumer.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                card_consumer.terminate()
+                card_consumer.wait(timeout=5)
             server.shutdown()
             server.demos.close()
             server.server_close()

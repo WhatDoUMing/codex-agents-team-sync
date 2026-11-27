@@ -203,6 +203,151 @@ async function checkWorkspace(){
   await screenshot("project-delegation-desktop.png",1280,900);
   pass("authenticated project delegation renders separate manager, lead and worker sessions with proof");
 }
+
+async function checkLiveCards(focused){
+ const selector=(id)=>`[data-employee="${id}"]`;
+ const owner=selector("card-owner"), formal=selector("card-formal");
+ const correct=card=>card+" > button";
+ const text=card=>"document.querySelector("+JSON.stringify(card)+").textContent";
+ const disabled=card=>"document.querySelector("+JSON.stringify(correct(card))+").disabled";
+ const phase=(value)=>fs.writeFileSync(path.join(temp,"card-consumer-phase.txt"),value);
+ const openPool=async()=>{
+  await wait("!!document.querySelector('[data-department-choice=collaboration]')","native fixture department listed");
+  await click("[data-department-choice=collaboration]");
+  await wait("!!document.querySelector("+JSON.stringify(owner)+")","native fixture cards rendered");
+ };
+ if(await evaluate("!$('project-view').hidden")) await click("#workspace-back");
+ await click("#workspace-open");
+ await wait("!!document.querySelector('[data-project-choice=native-cards]')","live-card test project listed");
+ await click("[data-project-choice=native-cards]");
+ await openPool();
+ await wait("!"+disabled(owner),"original owner polls the native inbox");
+ assert.equal(await evaluate(text(owner)+".includes('岗位登记工作 本人原有任务') && "+text(owner)+".includes('来自本人的实际任务描述')"),true);
+ assert.equal(await evaluate(text(owner)+".includes('qa-self-reported（本人自报）')"),true);
+ for(const other of ["card-observer","card-unpolled","card-foreign","card-demo","card-ambiguous"]){
+  assert.equal(await evaluate(disabled(selector(other))),true);
+ }
+ assert.equal(await evaluate(text(selector("card-foreign"))+".includes('Self-report card-foreign') || "+
+  text(selector("card-demo"))+".includes('Self-report card-demo') || "+
+  text(selector("card-ambiguous"))+".includes('Self-report card-ambiguous')"),false);
+ assert.equal(await evaluate(text(selector("card-observer"))+".includes('仅观察')"),true);
+ pass("employee card binds declared identity and actual task while observe, cross-project, unpolled and demo cards stay unavailable");
+
+ await evaluate("window.__liveCardPosts=[];window.__liveCardFetch=window.fetch;window.__loseCardReply=true;"+
+  "window.fetch=async(...args)=>{const p=String(args[0]),opt=args[1];if(opt?.method==='POST'&&['/api/commands','/api/aams/changes'].includes(p)){"+
+  "window.__liveCardPosts.push([p,JSON.parse(opt.body)]);const response=await window.__liveCardFetch(...args);"+
+  "if(p==='/api/commands'&&window.__loseCardReply){window.__loseCardReply=false;throw new Error('隔离首次应答丢失');}return response;}"+
+  "return window.__liveCardFetch(...args)}");
+ await click(correct(owner));
+ const details={instruction:"记录隔离状态并回报",acceptance:"可查询同一命令的本人领取和回报"};
+ await workspaceForm(details);
+ await wait("$('workspace-dialog-error').textContent.includes('隔离首次应答丢失')","simulated lost first reply after real protected POST");
+ await click("#workspace-dialog-submit");
+ await wait("!$('workspace-dialog').open","retry reconciles the same existing command");
+ const recorded=await evaluate("window.__liveCardPosts");
+ assert.equal(recorded.length,1);
+ assert.equal(recorded[0][0],"/api/commands");
+ assert.equal(recorded[0][1].project,"native-cards");
+ assert.equal(recorded[0][1].worker,"card-owner");
+ const commandId=recorded[0][1].command_id;
+ await wait(text(owner)+".includes('已排队') && !"+text(owner)+".includes('已领取')","discovery has no execution claim");
+ phase("claim");
+ await wait(text(owner)+".includes('已领取') && !"+text(owner)+".includes('已回报')","independent process consumes same command");
+ phase("report");
+ await wait(text(owner)+".includes('已回报')","explicit owner completion displays on the same card");
+ await click(owner+" summary");
+ await wait(text(owner)+".includes("+JSON.stringify(commandId)+") && "+
+  text(owner)+".includes('Independent consumer recorded the fixture status')","named command receipt and result can be opened");
+ await workspaceScreenshot("native-live-card-desktop.png",1280,900);
+ await workspaceScreenshot("native-live-card-mobile.png",390,900);
+ assert.equal(await evaluate("document.documentElement.scrollWidth<=window.innerWidth+1"),true);
+ const beforeReload=await evaluate("performance.timeOrigin");
+ await cdp("Page.reload");
+ await wait("performance.timeOrigin!=="+beforeReload+" && document.readyState==='complete' && "+
+  "document.querySelector("+JSON.stringify(owner)+")?.textContent.includes('已回报')",
+  "reload reads the same saved worker receipt");
+ pass("one authenticated employee click queues once across lost reply, actual consumer claims and reports, reload retains proof");
+
+ phase("poll");
+ await click(correct(owner));
+ await workspaceForm({instruction:"记录新一轮隔离状态",acceptance:"显示本次排队与上一单原回报"});
+ await wait("!$('workspace-dialog').open","second authenticated card instruction queued");
+ const readWorker="workspace.project.departments.find(d=>d.id==='collaboration').employees.find(e=>e.id==='card-owner').worker";
+ await wait(readWorker+".latest.state==='queued' && "+readWorker+".latest.id!=="+JSON.stringify(commandId),
+  "new command is queued while the previous command remains completed");
+ const next=await evaluate(readWorker+".latest");
+ assert.equal(next.claimant,null);
+ const receiptSummary=await evaluate("Object.fromEntries([...document.querySelectorAll("+
+  JSON.stringify(owner+" .work-receipts > div")+")].map(row=>[row.firstChild.textContent,row.querySelector('strong').textContent]))");
+ assert.equal(receiptSummary["最新指令"],"已排队");
+ assert.equal(receiptSummary["本次领取"],"待领取");
+ assert.equal(receiptSummary["本次回报"],"待回报");
+ if(!await evaluate("document.querySelector("+JSON.stringify(owner+" details")+").open")) await click(owner+" summary");
+ const receiptDetails=await evaluate("Object.fromEntries([...document.querySelectorAll("+
+  JSON.stringify(owner+" details .employee-facts > div")+")].map(row=>[row.firstChild.textContent,row.lastChild.textContent]))");
+ assert.equal(receiptDetails["本次指令"],next.id+" · 已排队");
+ assert.equal(receiptDetails["上次领取"].split(" · ")[0],commandId);
+ assert.equal(receiptDetails["上次回报"].split(" · ")[0],commandId);
+ assert.equal(receiptDetails["回报内容"],"Independent consumer recorded the fixture status");
+ await workspaceScreenshot("native-live-card-two-commands.png",1280,900);
+ pass("a newer queued command has no current receipt and the earlier claim and result retain their original command ID");
+ const receiptOrdering={current:{id:next.id,state:next.state,claimant:next.claimant},previous:{id:commandId,
+  claim:receiptDetails["上次领取"],receipt:receiptDetails["上次回报"],result:receiptDetails["回报内容"]},summary:receiptSummary};
+ if(focused) return receiptOrdering;
+
+ phase("offline");
+ await wait(disabled(owner)+" && "+text(owner)+".includes('心跳 / 租约已过期')","one stale owner is no longer a correction target");
+ phase("poll");
+ await wait("!"+disabled(owner),"same owner heartbeat and polling recover the existing card");
+ await click('[data-workspace-action="collaboration:pause"]');
+ await click("#workspace-dialog-submit");
+ await wait(disabled(owner)+" && workspace.project.departments[0].paused","department pause bars cooperative corrections");
+ await click('[data-workspace-action="collaboration:pause"]');
+ await click("#workspace-dialog-submit");
+ await wait("!"+disabled(owner),"department resume restores an active consumer");
+ await click("#workspace-back-departments");
+ await evaluate("[...$('project-delegations').querySelectorAll('button')].find(b=>b.textContent==='暂停后续委托派发').click()");
+ await click("#workspace-dialog-submit");
+ await wait("workspace.project.delegations_paused","project pause confirmed");
+ await openPool();
+ assert.equal(await evaluate(disabled(owner)),true);
+ await click("#workspace-back-departments");
+ await evaluate("[...$('project-delegations').querySelectorAll('button')].find(b=>b.textContent==='恢复委托派发').click()");
+ await click("#workspace-dialog-submit");
+ await wait("!workspace.project.delegations_paused","project resume confirmed");
+ await openPool();
+ assert.equal(await evaluate(disabled(owner)),false);
+ pass("stale cooperative worker becomes unavailable, real polling restores it, and both pause controls keep corrections disabled");
+
+ await evaluate("window.__loopCardPosts=[];window.__cardOriginalFetch=window.fetch;window.fetch=(...args)=>{const p=String(args[0]);"+
+  "if(args[1]?.method==='POST'&&['/api/commands','/api/aams/changes'].includes(p))window.__loopCardPosts.push(p);"+
+  "return window.__cardOriginalFetch(...args);}");
+ await click(correct(formal));
+ await workspaceForm({instruction:"隔离 Loop 检查",acceptance:"核对真实来源标签"});
+ await wait(text(formal)+".includes('qa-loop-turn-model')","formal turn_context reloads on formal card");
+ assert.deepEqual(await evaluate("window.__loopCardPosts"),["/api/aams/changes"]);
+ await click(formal+" summary");
+ await wait(text(formal)+".includes('Codex 当前轮 turn_context') && "+text(formal)+".includes('本人自报模型')",
+  "formal runtime metadata and local self-report retain separate source labels");
+ await evaluate("window.fetch=window.__cardOriginalFetch;");
+ await click("#workspace-back-departments");
+ await click("[data-department-choice=backup-collaboration]");
+ assert.equal(await evaluate(disabled(formal)),true);
+ assert.equal(await evaluate(disabled(selector("card-ambiguous"))),true);
+ assert.equal(await evaluate(text(formal)+".includes('Self-report card-formal') || "+
+  text(selector("card-ambiguous"))+".includes('Self-report card-ambiguous')"),false);
+ pass("formal bindings still use Loop corrections and retain turn_context distinctly from an owner's model report");
+ return receiptOrdering;
+}
+
+function writeReport(screenshots,receiptOrdering){
+ assert.deepEqual(exceptions,[]);
+ const report={passed:true,browser:"installed Chrome headless; isolated temporary profile",checks:passes,
+  screenshots,receiptOrdering,runtimeExceptions:exceptions};
+ fs.writeFileSync(path.join(output,"browser-results.json"),JSON.stringify(report,null,2));
+ process.stdout.write("BROWSER QA PASS: "+passes.length+" checks\n");
+}
+
 (async()=>{
  try{
   const active=path.join(profile,"DevToolsActivePort");
@@ -235,7 +380,11 @@ async function checkWorkspace(){
   await cdp("Page.reload");
   await wait("!document.getElementById('dashboard').hidden&&latest!==null","same tab stays connected across reload");
   pass("automatic launch unlocks dashboard, clears fragment and survives reload");
-  await checkWorkspace();
+  const focused=process.env.TEAM_SYNC_QA_LIVE_CARDS_ONLY==="1";
+  if(!focused) await checkWorkspace();
+  const receiptOrdering=await checkLiveCards(focused);
+  const liveCardScreenshots=["native-live-card-desktop.png","native-live-card-mobile.png","native-live-card-two-commands.png"];
+  if(focused){writeReport(liveCardScreenshots,receiptOrdering);return;}
   await evaluate("document.getElementById('logout').click()");
   await login("incorrect-session-key");
   await wait("document.getElementById('notice').textContent.includes('解锁失败')","invalid key feedback");
@@ -276,7 +425,7 @@ async function checkWorkspace(){
   await evaluate("document.getElementById('project').value='';document.getElementById('project').dispatchEvent(new Event('change'))");
   await wait("latest&&latest.workers.length>=4","return to all projects");
   await evaluate("document.getElementById('start-demo').click()");
-  await wait("latest&&latest.workers.some(w=>w.is_demo)","echo demo starts");
+  await wait("latest&&latest.workers.some(w=>w.is_demo&&w.project==='demo')","echo demo starts");
   await evaluate("document.getElementById('project').value='demo';document.getElementById('project').dispatchEvent(new Event('change'))");
   await wait("latest&&latest.workers.length===1&&latest.workers[0].is_demo&&document.getElementById('target').value!==''","demo project selected");
   const directive='<img src=x onerror="window.__xss=1"> browser QA: receive text only, do not execute';
@@ -336,13 +485,9 @@ async function checkWorkspace(){
   await login(token);
   await wait("!document.getElementById('dashboard').hidden&&latest!==null","unlock after lock");
   pass("unlock works again after lock");
-  assert.deepEqual(exceptions,[]);
-  const report={passed:true,browser:"installed Chrome headless; isolated temporary profile",checks:passes,
-    screenshots:["project-home-desktop.png","project-home-mobile.png","project-departments-desktop.png","department-work-desktop.png",
+  writeReport(["project-home-desktop.png","project-home-mobile.png","project-departments-desktop.png","department-work-desktop.png",
       "department-work-mobile.png","department-review-desktop.png","department-blocker-desktop.png","project-delegation-desktop.png",
-      "dashboard-desktop.png","dashboard-mobile.png","native-metadata-desktop.png"],runtimeExceptions:exceptions};
-  fs.writeFileSync(path.join(output,"browser-results.json"),JSON.stringify(report,null,2));
-  process.stdout.write("BROWSER QA PASS: "+passes.length+" checks\n");
+      ...liveCardScreenshots,"dashboard-desktop.png","dashboard-mobile.png","native-metadata-desktop.png"],receiptOrdering);
  }finally{
   if(ws&&ws.readyState===WebSocket.OPEN){try{await cdp("Browser.close");}catch{}}
   if(child.exitCode===null){await Promise.race([once(child,"exit"),delay(5000)]);if(child.exitCode===null)child.kill();}

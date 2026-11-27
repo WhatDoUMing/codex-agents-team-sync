@@ -77,6 +77,16 @@ python -B .\sync.py --project alpha heartbeat alpha-worker-001 $generation --sta
 
 worker ID 在整个同步器库中全局唯一。不同项目或新的运行轮次用新的 ID，例如 alpha-build-20261112-001。重复注册不会覆盖旧记录或重启旧轮次。generation 绑定当前运行，错项目或错 generation 会被拒绝。
 
+已登记的非演示岗位可以用原代次开启协作。下面的三条命令均隐藏代次输入。已有代次的协作程序可以用 `--generation-stdin` 从管道传入。
+
+~~~powershell
+python -B .\sync.py --project alpha opt-in alpha-notes-001
+python -B .\sync.py --project alpha heartbeat alpha-notes-001 --status running --detail "核对当前工作"
+python -B .\sync.py --project alpha inbox alpha-notes-001
+~~~
+
+启用只更新原登记的收件箱能力。项目员工卡按项目和岗位身份关联本人任务，近期心跳和轮询齐备后才能经该卡发指令。同一岗位在多个部门登记时，按本人记录的部门标识核对归属。工作详情可回查实际领取和回报。本人可在心跳说明中填写 `{"detail":"本次进展","model":"gpt-6.2-sol","effort":"max"}`，其中型号和思考档位填本人实际使用值。
+
 状态：idle / running / blocked / completed / failed / stopped。后三个为终态，迟到的 running 心跳不能复活它们。新工作请登记新 ID。
 
 超过 30 秒无新心跳显示 stale；明显未来时间显示 clock_skew；终态不会因时间流逝变成 stale。心跳全部是自报，不是进程探活。
@@ -109,7 +119,7 @@ python -B .\sync.py --project alpha commands
 - inbox 轮询不刷新心跳。消费者仍须定期 heartbeat。
 - 未领取指令不自动删除或过期，不转投新轮次。
 
-自己的协作程序可通过 subprocess 调 CLI，或导入 sync.py 的 register / heartbeat / inbox / claim / ack。指令应白名单处理，消费者自行落实工作范围、权限和证据回报。没有默认任意 shell 执行器，也没有替 Dot 内部 agent 消费队列的桥接器。
+自己的协作程序可通过 subprocess 调 CLI，或导入 sync.py 的 register / opt_in / heartbeat / inbox / claim / ack。指令应白名单处理，消费者自行落实工作范围、权限和证据回报。没有默认任意 shell 执行器，也没有替 Dot 内部 agent 消费队列的桥接器。
 
 ### 独立 CLI 回显演示
 
@@ -257,3 +267,5 @@ C:\Program Files\Google\Chrome\Application\chrome.exe
 ## Windows 下载
 
 [下载 AAMS Windows ZIP](https://github.com/WhatDoUMing/codex-agents-team-sync/raw/refs/heads/main/release/aams-windows/AAMS-Windows.zip) · [中文使用指南](release/aams-windows/README.md) · [SHA-256 校验](release/aams-windows/SHA256SUMS.txt)
+
+下载后，在 AAMS 选择业务项目和部门即可查看员工卡、本人任务和最近心跳；卡片把最新命令的排队、当次领取与当次回报分开展示，旧命令则保留自己的 ID 并明确标成上次结果。符合条件的岗位可点「纠正此 Agent」。接入已登记的本地 worker 时，按[中文使用指南](release/aams-windows/README.md) 对原岗位原位 opt-in，并确认原消费者继续在同一数据库和项目中更新心跳、实际轮询、领取及回报。opt-in 不会接管或启动聊天会话。
