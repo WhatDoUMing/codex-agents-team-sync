@@ -3,11 +3,54 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AAMS · 团队进度同步器</title><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
 <body>
-<header><div class="brand"><span class="logo">◈</span><div><h1>AAMS 团队进度看板</h1><p>Agents Auto-Loop Management System</p></div></div><button id="logout" class="secondary" hidden>锁定面板</button></header>
-<main>
-<section class="intro"><span class="eyebrow">一个视图，分清事实与推测</span><h2>看清进度，再发指令。</h2><p>按项目和团队查看主动接入的 worker。排队不等于接收，心跳不等于真实进程存活。</p></section>
-<section id="login" class="card login"><h3>连接本地会话</h3><p>从启动终端复制本次「Session access key」。密钥不放在网址中，仅保留在当前标签页的会话存储。</p><form id="login-form"><label for="access-key">会话访问密钥</label><div class="row"><input id="access-key" type="password" autocomplete="off" spellcheck="false" required placeholder="粘贴本次会话密钥"><button type="submit">解锁面板</button></div></form></section>
+<header class="workspace-header">
+  <h1>AAMS 团队进度看板</h1>
+  <button id="logout" class="secondary" type="button" hidden>锁定面板</button>
+</header>
+<main class="workspace-content">
+<section id="login" class="workspace-connect" aria-labelledby="connect-heading">
+  <h2 id="connect-heading">连接本地应用</h2>
+  <p id="connection-status" role="status">从 AAMS 启动器打开此页面。</p>
+  <details id="manual-connection">
+    <summary>手动连接</summary>
+    <form id="login-form"><label for="access-key">会话密钥</label>
+      <div class="row"><input id="access-key" type="password" autocomplete="off" spellcheck="false" required><button type="submit">连接</button></div>
+    </form>
+  </details>
+</section>
 <div id="notice" role="status" aria-live="polite"></div>
+<div id="project-workspace" hidden>
+<section id="project-home" aria-labelledby="project-home-heading">
+  <div class="workspace-entry">
+    <h2 id="project-home-heading" tabindex="-1">项目</h2>
+    <div class="workspace-actions">
+      <button id="workspace-create" type="button">新建项目</button>
+      <button id="workspace-open" class="secondary" type="button">打开项目</button>
+    </div>
+  </div>
+</section>
+<p id="workspace-feedback" role="status" aria-live="polite"></p>
+<section id="project-view" hidden aria-labelledby="workspace-project-name">
+  <div class="workspace-project-heading">
+    <div>
+      <button id="workspace-back" class="workspace-text-button" type="button">返回项目</button>
+      <h2 id="workspace-project-name" tabindex="-1"></h2>
+    </div>
+    <button id="workspace-add-department" class="secondary" type="button" hidden>新建部门</button>
+  </div>
+  <div id="department-cards"></div>
+</section>
+<section id="department-view" hidden aria-labelledby="workspace-department-name">
+  <div class="workspace-project-heading">
+    <div>
+      <button id="workspace-back-departments" class="workspace-text-button" type="button">返回部门列表</button>
+      <h2 id="workspace-department-name" tabindex="-1"></h2>
+    </div>
+  </div>
+  <div id="department-detail-card"></div>
+  <details id="workspace-tools" class="workspace-tools" hidden>
+    <summary>工具与诊断</summary>
+    <button id="workspace-import-roster" class="secondary" type="button">导入岗位登记</button>
 <div id="dashboard" hidden>
 <section id="aams-order" class="card compose" hidden>
 <h3>潮核协议 · 首章鱼摊复测</h3><p>TP-CH01-FISH-01</p>
@@ -28,5 +71,20 @@
 <section><div class="section-head"><div><h3>指令流水</h3><p>已领取后崩溃的指令会保留「已接收、未完成」，不会自动重投执行。</p></div></div><div id="commands"></div></section>
 <section><div class="section-head"><div><h3>只读项目数据源与真实会话</h3><p>显式配置旧 SQLite 或官方 App Server 元数据。只读观察，不冒充网页可向原生会话发指令。</p></div></div><div id="sources"></div></section>
 </div>
-<footer>本地存储 · 无外部脚本 · 默认不调用模型，真实worker显式启用并消耗额度 · 不直接执行shell输入</footer>
-</main></body></html>
+  </details>
+</section>
+</div>
+</main>
+<dialog id="workspace-dialog" aria-labelledby="workspace-dialog-title">
+  <h2 id="workspace-dialog-title"></h2>
+  <p id="workspace-dialog-context" hidden></p>
+  <form id="workspace-dialog-form">
+    <div id="workspace-dialog-content"></div>
+    <p id="workspace-dialog-error" role="status" aria-live="polite"></p>
+    <div class="workspace-dialog-actions">
+      <button id="workspace-dialog-cancel" class="secondary" type="button">返回</button>
+      <button id="workspace-dialog-submit" type="submit" hidden></button>
+    </div>
+  </form>
+</dialog>
+</body></html>

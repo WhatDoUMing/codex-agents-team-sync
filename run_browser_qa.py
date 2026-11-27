@@ -1,16 +1,81 @@
 """Run real Chrome headless UI checks using only temporary fixtures and browser profiles."""
+import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from unittest.mock import patch
 import native_adapter
 import sync
 import web_server
 from aams_orders import LocalLoop
+from test_aams_projects import ProjectFixture, manifest
 from test_sync import make_legacy
+
+
+class BrowserProjectFixture(ProjectFixture):
+    """Supply captured-format receipts in a disposable Hub ledger, with no external requests."""
+
+    def __init__(self, root):
+        root.mkdir()
+        super().__init__(root)
+        self.put("runs", 10, {
+            "id": 10, "agent": "reviewer", "state": "done", "rules_version": 1,
+            "claimed_at": "2026-11-26T10:00:00Z", "finished_at": "2026-11-26T10:10:00Z",
+            "summary": "浏览器临时历史回执",
+        })
+
+    def runtime(self, model, effort):
+        session = str(uuid.uuid4())
+        date_dir = self.root / "codex" / "sessions" / "2026" / "11" / "26"
+        date_dir.mkdir(parents=True, exist_ok=True)
+        record = {"timestamp": "2026-11-26T10:01:00Z", "type": "turn_context",
+                  "payload": {"model": model, "effort": effort}}
+        (date_dir / f"rollout-fixture-{session}.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return session
+
+    def request(self, key, method, path, body=None, port=None):
+        previous = len(self.sent)
+        response = super().request(key, method, path, body, port)
+        if path == "/v1/state":
+            for agent in response["agents"]:
+                if agent["id"] == "reviewer":
+                    agent["online"] = False
+            return response
+        if len(self.sent) == previous:
+            return response
+        event = response["event"]
+        data = json.loads(body["detail"])
+        if body["type"] == "test.scope":
+            self.finish(event, "SCOPE player | 浏览器隔离验收仅影响试玩")
+        else:
+            reference = f"field/browser-{data['change_id']}.json"
+            (self.root.parent / reference).write_text(json.dumps({
+                "test": "isolated browser fixture", "change_id": data["change_id"], "task_id": data["task_id"],
+            }), encoding="utf-8")
+            if data["instruction"] == "浏览器 QA 记录卡点":
+                self.finish(event, "BLOCKED | 跳转入口不可用（隔离样例） | " + reference)
+            elif data["scope"] == "person" and not data.get("continuation"):
+                self.finish(event, "APPLIED | QA 已接收当前工作 | " + reference,
+                            session=self.runtime("qa-first-model", "max"))
+            else:
+                self.finish(event, "APPLIED_RESULT | QA 已记录结果 | " + reference,
+                            session=self.runtime("qa-result-model", "xhigh"))
+        return response
+
+    def roster(self):
+        result = manifest()
+        result["project"]["name"] = "潮核浏览器测试项目"
+        reviewer = next(agent for agent in result["departments"][0]["employees"] if agent["id"] == "reviewer")
+        reviewer["history_run"] = 10
+        result["departments"].append({
+            "id": "documentation", "name": "文档池", "lead": "scribe",
+            "mainline": "浏览器独立验证", "employees": [],
+        })
+        return result
 
 
 def main():
@@ -47,8 +112,12 @@ def main():
         native_mock.start()
         sync.source_add(db, "native-fixture", "native-fixture", fake_cli,
                         "Official metadata UI fixture", "codex-app-server", native_scope)
-        # This empty local fixture has no Loop configuration or keys. Browser orders stay pending here.
-        server = web_server.create_server(db, port=0, open_browser=True, order_loop=LocalLoop(root))
+        # Keep the prior order surface isolated. Only the new project surface uses synthetic Loop receipts.
+        project_fixture = BrowserProjectFixture(root / "project-loop")
+        (root / "field").mkdir()
+        server = web_server.create_server(db, port=0, open_browser=True, order_loop=LocalLoop(root),
+                                          project_loop=project_fixture.loop, project_evidence_root=root)
+        server.projects.configure(project_fixture.roster())
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         env = {**os.environ, "TEAM_SYNC_QA_URL": "http://127.0.0.1:%d/" % server.server_address[1],

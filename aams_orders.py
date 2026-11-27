@@ -75,6 +75,18 @@ class LocalLoop:
         self.home = Path(home) if home is not None else Path.home() / ".agent-autoloop"
         self.request, self.port, self.backend = request, port, backend
 
+    def route(self, row):
+        return role_for(row["role"])
+
+    def event(self, row):
+        return envelope(row)
+
+    def receipt(self, row, summary):
+        return parse_receipt(row, summary)
+
+    def execution(self, run):
+        return {}
+
     def check(self, row):
         config = json.loads((self.home / "config.json").read_text(encoding="utf-8-sig"))
         address = f"127.0.0.1:{self.port}"
@@ -84,7 +96,7 @@ class LocalLoop:
         if source.get("name") != "local" or not all(isinstance(k, str) and len(k) >= 24
                 for k in (source.get("key"), config.get("owner"))):
             raise ValueError("Loop 缺少本机来源或操作权限")
-        event_type, rule, agent = role_for(row["role"])
+        event_type, rule, agent = self.route(row)
         state = self.request(config["owner"], "GET", "/v1/state", port=self.port)
         lines = [v for v in state.get("lines", []) if v.get("name") == rule]
         if (len(lines) != 1 or lines[0].get("agent") != agent or lines[0].get("source") != "local"
@@ -102,11 +114,11 @@ class LocalLoop:
         return source["key"]
 
     def send(self, key, row):
-        result = self.request(key, "POST", "/v1/events", envelope(row), port=self.port)
+        result = self.request(key, "POST", "/v1/events", self.event(row), port=self.port)
         number = result.get("event")
         if type(number) is not int or number < 1:
             raise Conflict("Loop 未返回可核对的事件号")
-        _, rule, _ = role_for(row["role"])
+        _, rule, _ = self.route(row)
         return number, result.get("routed") == [rule] and not result.get("paused")
 
     def observe(self, row):
@@ -122,13 +134,13 @@ class LocalLoop:
             if not found:
                 return None
             event, = found
-            expected = envelope(row)
+            expected = self.event(row)
             if any(event.get(k) != expected[k] for k in ("type", "subject", "detail")):
                 raise Conflict("Loop 事件的岗位、任务或指令与本地记录冲突")
             event_id = event["id"]
             if type(event_id) is not int or event_id < 1 or row["event_id"] not in (None, event_id):
                 raise Conflict("Loop 事件号与已保存回执冲突")
-            _, rule, agent = role_for(row["role"])
+            _, rule, agent = self.route(row)
             if json.loads(event.get("paused") or "[]") or json.loads(event["routed"]) != [rule]:
                 return {"state": "unrouted", "event_id": event_id, "result": "Loop 未按预期岗位派发"}
             links = records("run_events", "json_extract(data,'$.event_id')=?", [event_id])
@@ -151,7 +163,7 @@ class LocalLoop:
                 raise Conflict("运行时生效的岗位配置缺少匹配的本机后端身份")
             state = run["state"]
             observed = {"event_id": event_id, "run_id": run_id, "claimed_at": run.get("claimed_at"),
-                        "finished_at": run.get("finished_at"), "state": state}
+                        "finished_at": run.get("finished_at"), "state": state, **self.execution(run)}
             if state == "claimed" and run.get("session"):
                 observed["state"] = "running"
             elif state == "done" and run.get("finished_at") and run.get("claimed_at"):
@@ -190,13 +202,13 @@ class LocalLoop:
                                     and card.get("closed_at")==follow["finished_at"] and card.get("result")==follow.get("summary")):
                                 observed["decision_run_id"] = follow_id
                                 try:
-                                    status, result, evidence = parse_receipt(row, follow.get("summary"))
-                                    observed.update(state=status,result=result,evidence=evidence)
+                                    status, result, evidence = self.receipt(row, follow.get("summary"))
+                                    observed.update(state=status,result=result,evidence=evidence,**self.execution(follow))
                                 except Conflict:
                                     observed.update(state="unverified",result="决策续办轮次缺少同版有效回执")
                 else:
                     try:
-                        status, result, evidence = parse_receipt(row, run.get("summary"))
+                        status, result, evidence = self.receipt(row, run.get("summary"))
                         observed.update(state=status, result=result, evidence=evidence)
                     except Conflict as exc:
                         observed.update(state="unverified", result=str(exc), evidence=run.get("summary") or "")
