@@ -6,7 +6,7 @@ const assert=require("node:assert/strict");
 const url=process.env.TEAM_SYNC_QA_URL, token=process.env.TEAM_SYNC_QA_TOKEN, temp=process.env.TEAM_SYNC_QA_TEMP;
 if(!url||!token||!temp)throw new Error("Run via python -B run_browser_qa.py");
 const chrome=process.env.TEAM_SYNC_CHROME || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-const output=path.join(__dirname,"verification");
+const output=process.env.TEAM_SYNC_QA_OUTPUT || path.join(__dirname,"verification");
 fs.mkdirSync(output,{recursive:true});
 const profile=fs.mkdtempSync(path.join(temp,"chrome-profile-"));
 const child=spawn(chrome,["--headless=new","--disable-gpu","--no-first-run","--no-default-browser-check",
@@ -45,6 +45,149 @@ async function screenshot(name,width,height){
  const shot=await cdp("Page.captureScreenshot",{format:"png",captureBeyondViewport:true,clip:{x:0,y:0,width,height:Math.ceil(size.height),scale:1}});
  fs.writeFileSync(path.join(output,name),Buffer.from(shot.data,"base64"));
 }
+async function workspaceScreenshot(name,width,height){
+ await cdp("Emulation.setDeviceMetricsOverride",{width,height,deviceScaleFactor:1,mobile:width<600});
+ await evaluate("window.scrollTo(0,0)");
+ await delay(150);
+ const shot=await cdp("Page.captureScreenshot",{format:"png",captureBeyondViewport:false});
+ fs.writeFileSync(path.join(output,name),Buffer.from(shot.data,"base64"));
+}
+async function click(selector){
+ await evaluate("document.querySelector("+JSON.stringify(selector)+").click()");
+}
+async function workspaceForm(values){
+ await evaluate("Object.entries("+JSON.stringify(values)+").forEach(([name,value])=>{$('workspace-dialog-form').elements.namedItem(name).value=value;});$('workspace-dialog-form').requestSubmit()");
+}
+async function openDepartment(){
+ await click("#workspace-open");
+ await wait('!!document.querySelector(\'[data-project-choice="tp"]\')',"local project is listed");
+ await click('[data-project-choice="tp"]');
+ await wait('!!document.querySelector(\'[data-department-choice="combat"]\')',"departments are listed");
+ await click('[data-department-choice="combat"]');
+ await wait('!$("department-view").hidden && !!document.querySelector(\'[data-employee="player"]\')',"combat department opens");
+}
+async function checkWorkspace(){
+ const homeButtons=await evaluate("[...$('project-home').querySelectorAll('button')].map(button=>button.textContent.trim())");
+ assert.deepEqual(homeButtons,["新建项目","打开项目"]);
+ assert.equal(await evaluate("$('project-view').hidden && $('department-view').hidden && $('logout').hidden"),true);
+ assert.equal(await evaluate("document.documentElement.scrollHeight<=innerHeight+1"),true);
+ await workspaceScreenshot("project-home-desktop.png",1280,900);
+ await workspaceScreenshot("project-home-mobile.png",390,900);
+ assert.equal(await evaluate("document.documentElement.scrollHeight<=innerHeight+1 && document.documentElement.scrollWidth<=innerWidth+1"),true);
+ pass("project home has two Chinese actions and fits both single-screen viewports");
+
+ await click("#workspace-create");
+ await workspaceForm({name:"浏览器新建项目"});
+ await wait("$('workspace-project-name').textContent==='浏览器新建项目' && !$('workspace-add-department').hidden","create a project");
+ await click("#workspace-add-department");
+ await workspaceForm({name:"临时部门",mainline:"临时主线"});
+ await wait("$('department-cards').textContent.includes('临时部门')","create a department");
+ await click("#department-cards button");
+ await wait("$('department-view').textContent.includes('临时主线')","open a new department");
+ assert.equal(await evaluate("document.querySelector('.mainline-card button').disabled"),true);
+ assert.equal(await evaluate("document.querySelector('.employee-card button').disabled"),true);
+  await click(".department-details summary");
+  await evaluate("[...document.querySelectorAll('.department-details button')].find(button=>button.textContent==='添加观察员工').click()");
+  await workspaceForm({name:"隔离观察员工",task_title:"核对临时工作"});
+  await wait("$('department-view').textContent.includes('核对临时工作')","register an observation-only employee");
+  await click("#workspace-tools summary");
+  await click("#workspace-import-roster");
+  await evaluate("window.__setRoster=manifest=>{const source=new DataTransfer();source.items.add(new File([JSON.stringify(manifest)],'local-roster.json',{type:'application/json'}));$('workspace-dialog-form').elements.manifest.files=source.files;$('workspace-dialog-form').requestSubmit();}; window.__setRoster({project:{id:'wrong-project'},departments:[]});");
+  await wait("$('workspace-dialog-error').textContent.includes('与当前打开的项目不一致')","roster import refuses a different project");
+  await evaluate("const p=workspace.project,d=p.departments[0],lead=d.employees.find(emp=>emp.lead);window.__setRoster({project:{id:p.id,name:p.name},departments:[{id:d.id,name:d.name,lead:lead.id,mainline:d.mainline.instruction,employees:[{id:'qa-imported',name:'导入观察岗',task_id:'qa-imported-task',task_title:'核对导入结果'}]}]});");
+  await wait("$('department-view').textContent.includes('导入观察岗')","roster import updates the opened project");
+ await click("#workspace-back-departments");
+ await click("#workspace-back");
+  pass("create project, department, and observation employee; import binds only the opened project");
+
+ await click("#workspace-open");
+ await wait('!!document.querySelector(\'[data-project-choice="tp"]\')',"list and reopen the existing test project");
+ await click('[data-project-choice="tp"]');
+ await wait("document.querySelectorAll('#department-cards button').length===2","project shows registered departments");
+ assert.equal(await evaluate("$('department-view').hidden && $('department-detail-card').children.length===0"),true);
+ await workspaceScreenshot("project-departments-desktop.png",1280,900);
+ assert.equal(await evaluate("[...$('department-cards').children].every(card=>card.getBoundingClientRect().top===$('department-cards').firstChild.getBoundingClientRect().top)"),true);
+ await click('[data-department-choice="combat"]');
+ await wait('!!document.querySelector(\'[data-employee="player"]\')',"department detail contains work cards");
+ assert.equal(await evaluate("document.querySelector('.employee-card').dataset.employee"),"boss");
+ assert.equal(await evaluate("$('project-view').hidden && !$('workspace-tools').open && !document.querySelector('.department-details').open"),true);
+ assert.equal(await evaluate("document.querySelector('[data-employee=reviewer]').textContent.includes('已完成')"),true);
+ await wait("document.querySelector('[data-employee=reviewer] .employee-details').textContent.includes('离线')","offline & historical work states remain independent");
+ assert.equal(await evaluate("document.querySelector('[data-employee=reviewer] .employee-details').textContent.includes('历史轮次#10')"),true);
+ assert.equal(await evaluate("document.querySelector('[data-employee=observer] button').disabled"),true);
+ pass("two-level navigation orders the lead first and distinguishes inactive presence from completed historical work");
+
+ await evaluate("window.__workspacePosts=[]; window.__workspaceFetch=window.fetch; window.fetch=(...args)=>{if(String(args[0])==='/api/aams/changes'&&args[1]?.method==='POST')window.__workspacePosts.push(JSON.parse(args[1].body));return window.__workspaceFetch(...args);};");
+ await click('[data-workspace-action="combat:mainline"]');
+ assert.equal(await evaluate("$('workspace-dialog-form').dataset.workspaceForm"),"mainline");
+ await workspaceForm({instruction:"核对浏览器主线流程",acceptance:"保留同版结果"});
+ await wait("$('workspace-feedback').textContent.includes('已登记 v1')","mainline submission reaches the real server");
+ const mainline=await evaluate("window.__workspacePosts[0]");
+ assert.deepEqual([mainline.project,mainline.department,mainline.scope,mainline.agent,mainline.task_id,mainline.expected_version],["tp","combat","mainline",null,null,0]);
+ await wait("workspace.project.departments[0].mainline.effective_version===1","manager receipt and worker effect reconcile");
+ assert.equal(await evaluate("document.querySelector('.mainline-card').textContent.includes('核对浏览器主线流程')"),true);
+ pass("mainline starts at the department scope and displays the effective revision after receipts");
+
+ const player='[data-employee="player"]';
+ const correct=player+" button";
+ assert.equal(await evaluate("document.querySelector("+JSON.stringify(correct)+").textContent"),"纠正此 Agent");
+ await click(correct);
+ assert.equal(await evaluate("$('workspace-dialog-form').dataset.workspaceForm"),"person");
+ assert.equal(await evaluate("$('workspace-dialog-form').elements.instruction.value"),"");
+ await workspaceForm({instruction:"浏览器 QA 当前任务纠正",acceptance:"只验收当前任务"});
+ await wait("document.querySelector('[data-employee=player]').textContent.includes('qa-first-model')","personal change has its own first bound receipt");
+ const personal=await evaluate("window.__workspacePosts[1]");
+ assert.deepEqual([personal.project,personal.department,personal.scope,personal.agent,personal.task_id,personal.expected_version],["tp","combat","person","player","fish",0]);
+ assert.equal(await evaluate("workspace.project.departments[0].employees.find(e=>e.id==='reviewer').task.version"),0);
+ assert.equal(await evaluate("workspace.project.departments[0].mainline.version"),1);
+ assert.equal(await evaluate("document.querySelector('[data-employee=player] .work-receipts').textContent.includes('有结果')"),false);
+ await click(".department-details summary");
+ await evaluate("[...document.querySelectorAll('.department-details button')].find(b=>b.textContent==='续收同版结果').click()");
+ await click("#workspace-dialog-submit");
+ await wait("document.querySelector('[data-employee=player]').textContent.includes('qa-result-model')&&document.querySelector('[data-employee=player] .work-receipts').textContent.includes('有结果')","card follows the later result, not the first applied receipt");
+ assert.equal(await evaluate("document.querySelector('[data-employee=player]').textContent.includes('qa-first-model')"),false);
+ assert.equal(await evaluate("document.querySelector('[data-employee=player]').textContent.includes('xhigh')"),true);
+ await evaluate("[...document.querySelectorAll('.department-details button')].find(b=>b.textContent==='查看现场证据').click()");
+ await wait("$('workspace-dialog-content').textContent.includes('isolated browser fixture')","bound attachment opens with the authenticated browser");
+ await click("#workspace-dialog-cancel");
+  const outcome=await evaluate("(async()=>{const c=window.__workspacePosts[1];const response=await fetch('/api/aams/reviews',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+sessionStorage.getItem('team-sync-session')},body:JSON.stringify({change_id:c.request_id,reviewer:'independent',review_run:null,conclusion:'浏览器隔离审核结论',candidate:'abc1234',commit:'def5678',pr:'https://github.com/example/aams/pull/10',evidence:'field/browser-'+c.request_id+'.json'})});return {status:response.status,data:await response.json()};})()");
+  assert.equal(outcome.status,200,JSON.stringify(outcome.data));
+  await wait("document.querySelector('.workspace-review')?.textContent.includes('浏览器隔离审核结论')","review result becomes visible under details");
+  const review=await evaluate("(()=>{const r=document.querySelector('.workspace-review');const a=r.querySelector('a');return {text:r.textContent,href:a?.href,rel:a?.rel};})()");
+  assert(review.text.includes("independent") && review.text.includes("本地独立审核员自报") &&
+    review.text.includes("abc1234") && review.text.includes("def5678"));
+  assert.equal(review.href,"https://github.com/example/aams/pull/10");
+  assert.equal(review.rel,"noopener noreferrer");
+  await click(".workspace-review button");
+  await wait("$('workspace-dialog-content').textContent.includes('isolated browser fixture')","authenticated review attachment opens");
+  await click("#workspace-dialog-cancel");
+  await screenshot("department-review-desktop.png",1280,900);
+ await click(".department-details summary");
+ await evaluate("window.fetch=window.__workspaceFetch;");
+ pass("personal correction is scoped to the current agent and task and follows bound result evidence");
+  pass("independent review displays source, conclusion, candidate, commit, PR link, and authenticated attachment");
+
+ await click('[data-workspace-action="combat:pause"]');
+ await click("#workspace-dialog-submit");
+ await wait("document.querySelector('[data-workspace-action=\"combat:pause\"]').textContent==='恢复派发'","pause readback");
+ await click('[data-workspace-action="combat:pause"]');
+ await click("#workspace-dialog-submit");
+ await wait("document.querySelector('[data-workspace-action=\"combat:pause\"]').textContent==='暂停后续派发'","resume readback");
+ await workspaceScreenshot("department-work-desktop.png",1280,900);
+ await workspaceScreenshot("department-work-mobile.png",390,900);
+ assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth+1"),true);
+ pass("card pause and resume confirm readback and the department fits mobile width");
+
+  await click(correct);
+  await workspaceForm({instruction:"浏览器 QA 记录卡点",acceptance:"保存真实卡点回执"});
+  await wait("document.querySelector('[data-employee=player] .work-receipts').textContent.includes('有卡点')","terminal blocker appears on the current card");
+  assert.equal(await evaluate("document.querySelector('[data-employee=player] .work-receipts').textContent.includes('有结果')"),false);
+  assert.equal(await evaluate("workspaceDeliveryStates.reconciling"),"旧版对账中");
+  await click(".department-details summary");
+  await wait("document.querySelector('.department-details').textContent.includes('跳转入口不可用（隔离样例）')","the blocker receipt stays readable in the department details");
+  await screenshot("department-blocker-desktop.png",1280,900);
+  pass("a terminal blocker retains evidence without claiming a result; older revisions are labeled as reconciliation");
+}
 (async()=>{
  try{
   const active=path.join(profile,"DevToolsActivePort");
@@ -77,6 +220,7 @@ async function screenshot(name,width,height){
   await cdp("Page.reload");
   await wait("!document.getElementById('dashboard').hidden&&latest!==null","same tab stays connected across reload");
   pass("automatic launch unlocks dashboard, clears fragment and survives reload");
+  await checkWorkspace();
   await evaluate("document.getElementById('logout').click()");
   await login("incorrect-session-key");
   await wait("document.getElementById('notice').textContent.includes('解锁失败')","invalid key feedback");
@@ -84,6 +228,8 @@ async function screenshot(name,width,height){
   pass("wrong key is rejected in the real page");
   await login(token);
   await wait("!document.getElementById('dashboard').hidden&&latest!==null","valid key unlock");
+  await openDepartment();
+  await click("#workspace-tools summary");
   pass("authenticated worker and source cards render");
   await wait("!$('aams-order').hidden&&!$('order-submit').disabled","local AAMS order form");
   await evaluate("$('order-instruction').value='QA normal route';$('order-acceptance').value='QA actual evidence';$('order-form').requestSubmit()");
@@ -177,7 +323,9 @@ async function screenshot(name,width,height){
   pass("unlock works again after lock");
   assert.deepEqual(exceptions,[]);
   const report={passed:true,browser:"installed Chrome headless; isolated temporary profile",checks:passes,
-    screenshots:["dashboard-desktop.png","dashboard-mobile.png","native-metadata-desktop.png"],runtimeExceptions:exceptions};
+    screenshots:["project-home-desktop.png","project-home-mobile.png","project-departments-desktop.png","department-work-desktop.png",
+      "department-work-mobile.png","department-review-desktop.png","department-blocker-desktop.png",
+      "dashboard-desktop.png","dashboard-mobile.png","native-metadata-desktop.png"],runtimeExceptions:exceptions};
   fs.writeFileSync(path.join(output,"browser-results.json"),JSON.stringify(report,null,2));
   process.stdout.write("BROWSER QA PASS: "+passes.length+" checks\n");
  }finally{

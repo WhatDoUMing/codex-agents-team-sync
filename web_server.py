@@ -1,5 +1,7 @@
 """Loopback-only authenticated dashboard. No external assets, CORS, or command execution."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
+import http.client
 import hmac
 import json
 import os
@@ -16,6 +18,7 @@ import loop_status
 import loop_control
 from aams_orders import LocalLoop, OrderBoard, Conflict
 from aams_evidence import EvidenceLibrary, ROUTES
+from aams_projects import ProjectBoard, ProjectLoop
 
 ASSETS = Path(__file__).resolve().parent / "ui"
 MAX_BODY = 40000
@@ -28,6 +31,7 @@ class BrowserLaunch:
         self.ticket = secrets.token_urlsafe(32)
         self.expires = time.monotonic() + LAUNCH_TTL
         self.lock = threading.Lock()
+        self.instance = secrets.token_hex(16)
 
     def redeem(self, offered):
         if not isinstance(offered, str) or not offered.isascii() or len(offered) != 43:
@@ -38,6 +42,50 @@ class BrowserLaunch:
                 return False
             self.ticket = None
             return True
+
+    def register(self,path,port):
+        with sync.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TABLE IF NOT EXISTS aams_launch_instances(port INTEGER PRIMARY KEY,instance TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS aams_launch_tickets(instance TEXT NOT NULL,digest TEXT PRIMARY KEY,expires REAL NOT NULL)")
+            db.execute("INSERT INTO aams_launch_instances VALUES(?,?) ON CONFLICT(port) DO UPDATE SET instance=excluded.instance",(port,self.instance))
+            db.execute("DELETE FROM aams_launch_tickets WHERE expires<=? OR instance NOT IN (SELECT instance FROM aams_launch_instances)",(time.time(),))
+
+    def redeem_local(self,path,ticket):
+        if not isinstance(ticket,str) or len(ticket)!=43 or not ticket.isascii():
+            return False
+        with sync.connect(path) as db:
+            return db.execute("DELETE FROM aams_launch_tickets WHERE instance=? AND digest=? AND expires>?",
+                              (self.instance,hashlib.sha256(ticket.encode()).hexdigest(),time.time())).rowcount==1
+
+
+def existing_launch(path,port):
+    """Mint a single-use browser ticket through the same local database as the live server."""
+    if not Path(path).is_file():
+        return None
+    conn=http.client.HTTPConnection("127.0.0.1",port,timeout=2)
+    try:
+        conn.request("GET","/api/session/instance")
+        response=conn.getresponse()
+        if response.status!=200:
+            return None
+        info=json.loads(response.read(512))
+        if info.get("protocol")!="AAMS-local-launch/1" or not isinstance(info.get("instance"),str):
+            return None
+        ticket=secrets.token_urlsafe(32)
+        with sync.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            found=db.execute("SELECT instance FROM aams_launch_instances WHERE port=?",(port,)).fetchone()
+            if not found or found["instance"]!=info["instance"]:
+                return None
+            db.execute("DELETE FROM aams_launch_tickets WHERE expires<=?",(time.time(),))
+            db.execute("INSERT INTO aams_launch_tickets VALUES(?,?,?)",
+                       (info["instance"],hashlib.sha256(ticket.encode()).hexdigest(),time.time()+LAUNCH_TTL))
+        return f"http://127.0.0.1:{port}/#launch="+ticket
+    except (OSError,sqlite3.Error,ValueError,TypeError,http.client.HTTPException):
+        return None
+    finally:
+        conn.close()
 
 
 class LoopbackHTTPServer(ThreadingHTTPServer):
@@ -53,6 +101,8 @@ class LoopbackHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
     def server_close(self):
+        if getattr(self, "projects", None) is not None:
+            self.projects.close()
         if getattr(self, "orders", None) is not None:
             self.orders.close()
         super().server_close()
@@ -136,6 +186,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(200, (ASSETS / name).read_bytes(), kind)
             except OSError:
                 self._reply(500, {"error": "dashboard assets missing"})
+            return
+        if parts.path=="/api/session/instance" and not parts.query and self.server.browser_launch is not None:
+            self._reply(200,{"protocol":"AAMS-local-launch/1","instance":self.server.browser_launch.instance})
+            return
+        if parts.path in ("/api/aams/projects","/api/aams/project","/api/aams/attachment"):
+            if not self._validate(authenticated=True):
+                return
+            try:
+                params=parse_qs(parts.query,strict_parsing=True,keep_blank_values=True,max_num_fields=2)
+                if any(len(v)!=1 for v in params.values()):
+                    raise ValueError("参数重复")
+                if parts.path=="/api/aams/projects" and not params:
+                    result=self.server.projects.projects()
+                elif parts.path=="/api/aams/project" and set(params)=={"project"}:
+                    result=self.server.projects.view(params["project"][0])
+                elif parts.path=="/api/aams/attachment" and set(params)=={"change_id","ref"}:
+                    result=self.server.projects.attachment(params["change_id"][0],params["ref"][0])
+                else:
+                    raise ValueError("项目查询参数不完整")
+                self._reply(200,result)
+            except (ValueError,TypeError,KeyError,OSError,sqlite3.Error) as exc:
+                self._reply(400,{"error":str(exc)})
             return
         if parts.path == "/api/loop/status" and not parts.query:
             if self._validate(authenticated=True):
@@ -232,10 +304,27 @@ class Handler(BaseHTTPRequestHandler):
                 if (self.server.browser_launch is None or
                         self.headers["Host"] != self.server.launch_host or
                         set(body) != {"ticket"} or
-                        not self.server.browser_launch.redeem(body["ticket"])):
+                        not (self.server.browser_launch.redeem(body["ticket"]) or
+                             self.server.browser_launch.redeem_local(self.server.db_path,body["ticket"]))):
                     self._reply(401, {"error": "local launch ticket invalid, expired or already used"})
                     return
                 self._reply(200, {"token": self.server.access_token})
+                return
+            registry=self.server.projects
+            actions={"/api/aams/projects":registry.create_project,"/api/aams/departments":registry.add_department,
+                     "/api/aams/employees":registry.employee,"/api/aams/changes":registry.issue,
+                     "/api/aams/changes/continue":registry.continue_change,"/api/aams/departments/pause":registry.pause,
+                     "/api/aams/roster/import":registry.configure,"/api/aams/reviews":registry.review}
+            if self.path in actions:
+                try:
+                    if self.path in ("/api/aams/changes","/api/aams/changes/continue","/api/aams/departments/pause") and registry.loop is None:
+                        self._reply(403,{"error":"当前入口仅观察，请使用本机操作看板"})
+                        return
+                    self._reply(200,actions[self.path](**body))
+                except Conflict as exc:
+                    self._reply(409,{"error":str(exc)})
+                except KeyError:
+                    self._reply(400,{"error":"缺少登记字段"})
                 return
             if self.path in ("/api/aams/order","/api/aams/order/continue"):
                 if self.server.orders is None:
@@ -319,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = do_PUT
 
 
-def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, codex_cli=None, owned_factory=None, loop_probe=None, control=None, open_browser=False, order_loop=None, evidence_root=None):
+def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, codex_cli=None, owned_factory=None, loop_probe=None, control=None, open_browser=False, order_loop=None, evidence_root=None, project_loop=None, project_evidence_root=None):
     if host != "127.0.0.1":
         raise ValueError("only 127.0.0.1 loopback binding is permitted")
     if type(port) is not int or not 0 <= port <= 65535:
@@ -343,6 +432,8 @@ def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, co
     server.launch_host = "127.0.0.1:" + str(actual_port)
     server.allowed_hosts = {server.launch_host, "localhost:" + str(actual_port)}
     server.browser_launch = BrowserLaunch() if open_browser else None
+    if server.browser_launch:
+        server.browser_launch.register(path,actual_port)
     server.demos = sync.DemoManager(path)
     server.loop_probe = loop_probe
     server.loop_control = control
@@ -355,6 +446,8 @@ def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, co
             server.server_close()
             raise
     server.orders = None
+    server.projects=ProjectBoard(path,project_loop,project_evidence_root)
+    server.projects.start()
     server.evidence = EvidenceLibrary(evidence_root)
     if order_loop is not None:
         try:
@@ -377,8 +470,14 @@ def open_local_dashboard(url):
 
 def serve(path, host="127.0.0.1", port=8765, source=None, codex_cli=None, open_browser=False):
     control = loop_control.configured()
+    if open_browser and host=="127.0.0.1" and port:
+        url=existing_launch(path,port)
+        if url:
+            open_local_dashboard(url)
+            return
     server = create_server(path, host, port, source=source, codex_cli=codex_cli,
                            control=control, open_browser=open_browser, order_loop=LocalLoop() if control else None,
+                           project_loop=ProjectLoop() if control else None,project_evidence_root=os.environ.get("AAMS_PROJECT_EVIDENCE_ROOT"),
                            evidence_root=os.environ.get("AAMS_EVIDENCE_ROOT") if control else None)
     url = "http://" + server.launch_host + "/"
     print("Local dashboard: " + url, flush=True)

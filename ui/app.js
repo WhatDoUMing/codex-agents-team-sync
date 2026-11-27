@@ -41,16 +41,26 @@ async function request(path, body){
   const response=await fetch(path, options);
   const data=await response.json();
   if(expectedEpoch!==sessionEpoch || expectedToken!==token){ const error=new Error("obsolete session response");error.name="ObsoleteSession";throw error; }
-  if(!response.ok){ if(response.status===401)lock(); throw new Error(data.error||"请求失败"); }
+  if(!response.ok){
+    if(response.status===401)lock();
+    const error=new Error(data.error||"请求失败");
+    error.status=response.status;
+    throw error;
+  }
   return data;
 }
 function lock(){
   clearOrder();
+  resetWorkspace();
   $("loop-control").hidden=true;$("control-result").textContent="";$("loop-rule").replaceChildren();$("loop-rule").disabled=true;$("control-model").textContent="";$("loop-probe").hidden=true;$("probe-dispatch").disabled=true;$("loop-source").textContent="尚未读取 Loop 状态";$("loop-rules").textContent="";$("loop-runs").replaceChildren();sessionEpoch++;viewEpoch++;refreshSequence++;refreshBusy=false;token="";sessionStorage.removeItem("team-sync-session");latest=null;knownProjects.clear();$("login").hidden=false;$("dashboard").hidden=true;$("logout").hidden=true;$("access-key").value="";$("workers").replaceChildren();$("commands").replaceChildren();$("sources").replaceChildren();$("target").replaceChildren();$("instruction").value="";$("project").replaceChildren(el("option","","全部项目"));$("project").firstChild.value="";commandAttempt=null;demoAttempt=null;ownedAttempt=null;composerFlight=null;$("instruction").disabled=false;$("target").disabled=false;$("delivery-mode").value="queue";$("delivery-mode").disabled=true;}
 function render(snapshot){
   const firstRender=$("dashboard").hidden;
   latest=snapshot;
-  $("login").hidden=true;$("dashboard").hidden=false;$("logout").hidden=false; if(firstRender){clearOrder();void refreshOrder();void refreshLoop();void refreshProbe();void refreshControl();}
+  $("login").hidden=true;$("dashboard").hidden=false;
+  if(firstRender){
+    activateWorkspace();
+    clearOrder();void refreshOrder();void refreshLoop();void refreshProbe();void refreshControl();
+  }
   const project=$("project").value;
   const enabled=!!(snapshot.owned_codex&&snapshot.owned_codex.enabled);
   $("start-owned").hidden=!enabled;
@@ -155,7 +165,7 @@ async function refresh(quiet=false,force=false){
 }
 $("login-form").addEventListener("submit",async e=>{
   e.preventDefault();sessionEpoch++;viewEpoch++;token=$("access-key").value.trim();
-  try{const data=await request("/api/snapshot");sessionStorage.setItem("team-sync-session",token);$("access-key").value="";render(data);notice("已连接本地会话。");}
+  try{const data=await request("/api/snapshot");sessionStorage.setItem("team-sync-session",token);$("access-key").value="";render(data);notice("");}
   catch(e){if(!obsolete(e))notice("解锁失败："+e.message,true);}
 });
 $("logout").addEventListener("click",()=>{lock();notice("面板已锁定，当前标签页的会话密钥已清除。");});
@@ -218,7 +228,10 @@ async function connectOnStartup(){
   const ticket=location.hash.slice("#launch=".length);
   history.replaceState(null,"",location.pathname+location.search);
   const epoch=++sessionEpoch;
+  sessionStorage.removeItem("team-sync-active-project");
+  sessionStorage.removeItem("team-sync-active-department");
   token=""; // Do not poll with a previous session while redeeming the launch ticket.
+  $("connection-status").textContent="正在连接本地应用…";
   const form=$("login-form");
   const fields=Array.from(form.elements);
   fields.forEach(f=>{f.disabled=true;});
@@ -532,4 +545,617 @@ $("order-form").addEventListener("submit",async event=>{
   finally{if(epoch===sessionEpoch){orderBusy=false;void refreshOrder();}}
 });
 setInterval(()=>{if(!document.hidden&&!$("dashboard").hidden)void refreshOrder();},3000);
+
+const workspace = {
+  projectId: null, departmentId: null, project: null, revision: 0, sequence: 0, loading: false,
+  fingerprint: null, dialog: null,
+};
+const workspaceAgentStates = {
+  online: "在线", offline: "离线", unknown: "待确认", observing: "仅观察",
+  idle: "待命", running: "执行中", blocked: "受阻", pending_review: "待验收",
+  completed: "已完成", paused: "暂停派发", ready: "待接单",
+};
+const workspaceDeliveryStates = {
+  ready: "待派发", sending: "派发中", queued: "已排队", claimed: "已接单",
+  running: "执行中", unknown: "结果待确认", decision: "待决策", scoped: "已确认范围",
+  applied: "已生效", reported: "有结果", blocked: "有卡点", unverified: "待核验",
+  unrouted: "未送达", reconciling: "旧版对账中", superseded: "已被新版替代",
+};
+
+function workspaceButton(text, onClick, className = "secondary") {
+  const button = el("button", className, text);
+  button.type = "button";
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function workspaceMessage(text, error = false) {
+  const status = $("workspace-feedback");
+  status.textContent = text;
+  status.classList.toggle("workspace-feedback-error", error);
+}
+
+function resetWorkspace() {
+  returnToWorkspaceHome(false);
+  $("project-workspace").hidden = true;
+  $("connection-status").textContent = "从 AAMS 启动器打开此页面。";
+}
+
+function activateWorkspace() {
+  $("project-workspace").hidden = false;
+  const savedProject = sessionStorage.getItem("team-sync-active-project");
+  if (savedProject) void openWorkspaceProject(savedProject, false, sessionStorage.getItem("team-sync-active-department"));
+}
+
+function returnToWorkspaceHome(focus = true) {
+  workspace.revision++;
+  workspace.projectId = null;
+  workspace.departmentId = null;
+  workspace.project = null;
+  workspace.fingerprint = null;
+  workspace.loading = false;
+  sessionStorage.removeItem("team-sync-active-project");
+  sessionStorage.removeItem("team-sync-active-department");
+  closeWorkspaceDialog();
+  $("project-view").hidden = true;
+  $("department-view").hidden = true;
+  $("project-home").hidden = false;
+  $("workspace-tools").open = false;
+  $("workspace-tools").hidden = true;
+  $("logout").hidden = true;
+  $("department-cards").replaceChildren();
+  $("department-detail-card").replaceChildren();
+  workspaceMessage("");
+  if (focus) $("project-home-heading").focus();
+}
+
+async function openWorkspaceProject(projectId, focus = true, departmentId = null) {
+  const revision = ++workspace.revision;
+  workspace.projectId = projectId;
+  workspace.departmentId = departmentId;
+  workspace.project = null;
+  workspace.fingerprint = null;
+  $("project-home").hidden = true;
+  $("project-view").hidden = false;
+  $("department-view").hidden = true;
+  $("workspace-tools").open = false;
+  $("workspace-tools").hidden = true;
+  $("workspace-add-department").hidden = true;
+  $("logout").hidden = false;
+  $("workspace-project-name").textContent = "本地项目";
+  $("department-cards").replaceChildren();
+  $("department-detail-card").replaceChildren();
+  workspaceMessage("正在打开项目…");
+  await refreshWorkspaceProject(true);
+  if (revision === workspace.revision && focus) $("workspace-project-name").focus();
+}
+
+async function refreshWorkspaceProject(force = false) {
+  if (!token || !workspace.projectId || (workspace.loading && !force)) return;
+  const revision = workspace.revision;
+  const sequence = ++workspace.sequence;
+  const projectId = workspace.projectId;
+  workspace.loading = true;
+  try {
+    const data = await request("/api/aams/project?" + new URLSearchParams({project: projectId}));
+    if (revision !== workspace.revision || sequence !== workspace.sequence) return;
+    if (data.id !== projectId || !Array.isArray(data.departments)) throw new Error("项目数据无效");
+    const fingerprint = JSON.stringify(data);
+    if (fingerprint !== workspace.fingerprint) {
+      renderWorkspaceProject(data);
+      workspace.fingerprint = fingerprint;
+    }
+    sessionStorage.setItem("team-sync-active-project", projectId);
+    if ($("workspace-feedback").textContent === "正在打开项目…" ||
+        $("workspace-feedback").dataset.readError === "true") workspaceMessage("");
+    delete $("workspace-feedback").dataset.readError;
+  } catch (error) {
+    if (obsolete(error) || revision !== workspace.revision || sequence !== workspace.sequence) return;
+    const status = $("workspace-feedback");
+    status.dataset.readError = "true";
+    workspaceMessage("读取项目失败。请核对连接或返回项目列表。", true);
+  } finally {
+    if (revision === workspace.revision && sequence === workspace.sequence) workspace.loading = false;
+  }
+}
+
+function renderWorkspaceProject(project) {
+  workspace.project = project;
+  $("workspace-project-name").textContent = project.name;
+  $("workspace-add-department").hidden = false;
+  const selected = project.departments.find(department => department.id === workspace.departmentId);
+  $("project-view").hidden = Boolean(selected);
+  $("department-view").hidden = !selected;
+  $("workspace-tools").hidden = !selected;
+  if (selected) {
+    $("workspace-department-name").textContent = selected.name;
+    sessionStorage.setItem("team-sync-active-department", selected.id);
+    renderSelectedWorkspaceDepartment(project, selected);
+    return;
+  }
+  workspace.departmentId = null;
+  sessionStorage.removeItem("team-sync-active-department");
+  $("workspace-tools").open = false;
+  $("department-detail-card").replaceChildren();
+  const content = project.departments.map(renderDepartmentSummary);
+  if (!content.length) content.push(el("p", "workspace-empty", "还没有部门。新建部门后即可填写主线与负责人。"));
+  $("department-cards").replaceChildren(...content);
+}
+
+function departmentPresence(department) {
+  const presence = department.paused ? "已暂停派发" : (workspaceAgentStates[department.status] || "待确认");
+  const review = Number.isInteger(department.pending_review) && department.pending_review > 0
+    ? department.pending_review + " 项待验收" : department.pending_review === true ? "待验收" : "";
+  return [presence, review].filter(Boolean).join(" · ");
+}
+
+function renderDepartmentSummary(department) {
+  const control = workspaceButton("", () => openWorkspaceDepartment(department.id), "department-card department-summary secondary");
+  control.dataset.department = department.id;
+  control.dataset.departmentChoice = department.id;
+  const lead = department.employees.find(employee => employee.lead);
+  control.append(el("span", "department-summary-title", department.name),
+    el("span", "workspace-muted", lead ? "负责人 · " + lead.name : "尚未登记负责人"),
+    el("span", "workspace-muted", departmentPresence(department)));
+  return control;
+}
+
+function openWorkspaceDepartment(departmentId) {
+  workspace.departmentId = departmentId;
+  workspaceMessage("");
+  renderWorkspaceProject(workspace.project);
+  $("workspace-department-name").focus();
+}
+
+function returnToWorkspaceDepartments() {
+  const previous = workspace.departmentId;
+  workspace.departmentId = null;
+  workspaceMessage("");
+  renderWorkspaceProject(workspace.project);
+  const card = [...$("department-cards").children].find(button => button.dataset.departmentChoice === previous);
+  (card || $("workspace-project-name")).focus();
+}
+
+function renderSelectedWorkspaceDepartment(project, department) {
+  const cards = $("department-detail-card");
+  const wasOpen = cards.querySelector(".department-details")?.open || false;
+  const openEmployees = new Set([...cards.querySelectorAll(".employee-details[open]")]
+    .map(details => details.closest(".employee-card").dataset.employee));
+  const active = document.activeElement;
+  const focusTarget = cards.contains(active) ? active.dataset.workspaceAction : null;
+  cards.replaceChildren(renderDepartment(project, department, wasOpen, openEmployees));
+  if (focusTarget) {
+    const match = [...cards.querySelectorAll("[data-workspace-action]")].find(item => item.dataset.workspaceAction === focusTarget);
+    if (match && !match.disabled) match.focus();
+  }
+}
+
+function renderDepartment(project, department, wasOpen, openEmployees) {
+  const card = el("article", "department-card");
+  card.dataset.department = department.id;
+  const mainline = el("section", "mainline-card");
+  const mainlineHeader = el("div", "mainline-heading");
+  const adjust = workspaceButton("调整主线", () => editWorkspaceChange(project, department));
+  adjust.dataset.workspaceAction = department.id + ":mainline";
+  adjust.disabled = department.can_adjust === false;
+  if (adjust.disabled) adjust.title = "负责人尚未绑定可投递的岗位";
+  const version = department.mainline?.version;
+  const effectiveVersion = department.mainline?.effective_version ?? version;
+  mainlineHeader.append(el("h4", "", "当前主线"), el("span", "work-version", effectiveVersion ? "v" + effectiveVersion : "初始主线"), adjust);
+  const instruction = department.mainline?.effective_instruction ?? department.mainline?.instruction;
+  mainline.append(mainlineHeader, el("p", "workspace-line-content", instruction || "尚未填写主线"));
+  if (version > effectiveVersion) {
+    const saved = department.changes.find(item => item.scope === "mainline" && item.version === version);
+    const received = saved?.received_by?.length > 0;
+    mainline.append(el("p", "workspace-muted", "已保存 v" + version + (received ? " · 已接收，待生效" : " · 待接收和生效")));
+  }
+
+  const employees = el("div", "employee-cards");
+  const ordered = [...department.employees].sort((a, b) => Number(b.lead) - Number(a.lead));
+  for (const employee of ordered) employees.append(renderEmployee(project, department, employee, openEmployees.has(employee.id)));
+  if (!ordered.length) employees.append(el("p", "workspace-muted", "尚未登记员工"));
+
+  const actions = el("div", "department-actions");
+  const pause = workspaceButton(department.paused ? "恢复派发" : "暂停后续派发", () => editWorkspacePause(project, department));
+  pause.dataset.workspaceAction = department.id + ":pause";
+  actions.append(el("p", "workspace-muted", departmentPresence(department)), pause);
+  card.append(mainline, employees, actions, renderDepartmentDetails(project, department, wasOpen));
+  return card;
+}
+
+function currentChange(department, receipt) {
+  if (!receipt) return null;
+  return department.changes.find(change => change.deliveries.some(delivery =>
+    delivery.agent === receipt.agent && delivery.bound_task === receipt.bound_task && delivery.stage === receipt.stage &&
+    delivery.event_id === receipt.event_id && delivery.run_id === receipt.run_id));
+}
+
+function appendFact(facts, label, value) {
+  const row = el("div");
+  row.append(el("dt", "", label), el("dd", "", value));
+  facts.append(row);
+}
+
+function receiptFact(label, text, confirmed, instant) {
+  const column = el("div");
+  column.append(el("span", "workspace-muted", label), el("strong", confirmed ? "has-receipt" : "", text));
+  const recorded = typeof instant === "string" && Number.isFinite(Date.parse(instant));
+  if (recorded) {
+    const time = el("time", "", new Date(instant).toLocaleTimeString("zh-CN", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    }));
+    time.dateTime = instant;
+    time.title = new Date(instant).toLocaleString("zh-CN");
+    column.append(time);
+  }
+  return column;
+}
+
+function renderEmployee(project, department, employee, detailOpen) {
+  const card = el("article", "employee-card");
+  card.dataset.employee = employee.id;
+  const current = employee.last_delivery;
+  const history = employee.history;
+  const heading = el("div", "employee-heading");
+  const name = el("h4", "", employee.name);
+  if (employee.lead) name.append(el("span", "employee-role", "负责人"));
+  heading.append(name);
+  const task = el("p", "work-title", employee.task?.title || "暂无当前工作");
+  if (employee.task) task.append(el("span", "employee-role work-version", "v" + employee.task.version));
+  const facts = el("dl", "employee-facts");
+  const workState = current ? workspaceDeliveryStates[current.state]
+    : history ? loopStates[history.state] : employee.manual ? states[employee.manual.status] : employee.task ? "已登记" : "待分配";
+  appendFact(facts, "工作状态", workState || "待确认");
+  appendFact(facts, "模型", employee.model_source && employee.model ? employee.model : "待核实");
+  appendFact(facts, "思考级别", employee.model_source && employee.effort ? employee.effort : "待核实");
+  const receipts = el("div", "work-receipts");
+  const claimed = current?.claimed_at || history?.claimed_at;
+  const applied = current?.applied_at;
+  const hasResult = current ? current.state === "reported" && Boolean(current.result)
+    : Boolean(history?.finished_at && history.result);
+  const hasBlocker = current?.state === "blocked";
+  receipts.append(
+    receiptFact("保存", employee.task ? "已保存" : "待登记", Boolean(employee.task)),
+    receiptFact("接收", claimed ? "已接收" : "待确认", Boolean(claimed), claimed),
+    receiptFact("生效", applied ? "已生效" : "待确认", Boolean(applied), applied),
+    receiptFact("结果", hasBlocker ? "有卡点" : hasResult ? "有结果" : "待结果", hasResult,
+      hasResult || hasBlocker ? current?.finished_at || history?.finished_at : null),
+  );
+  card.append(heading, task, facts, receipts);
+
+  if (employee.task) {
+    const correct = workspaceButton("纠正此 Agent", () => editWorkspaceChange(project, department, employee));
+    correct.dataset.workspaceAction = department.id + ":" + employee.id + ":correct";
+    correct.disabled = !employee.can_correct || employee.channel !== "loop";
+    if (correct.disabled) correct.title = employee.channel === "observe" ? "观察员工暂未接入派发" : "当前工作暂不能接收纠正";
+    card.append(correct);
+  }
+  card.append(renderEmployeeDetails(project, department, employee, detailOpen));
+  return card;
+}
+
+function renderEmployeeDetails(project, department, employee, open) {
+  const details = el("details", "employee-details");
+  details.open = open;
+  details.append(el("summary", "", "工作详情"));
+  const facts = el("dl", "employee-facts");
+  const current = employee.last_delivery;
+  const historical = employee.history;
+  appendFact(facts, "归属", project.name + " / " + department.name);
+  appendFact(facts, "在岗", employee.channel === "observe" ? "仅观察"
+    : employee.status === "unknown" ? "在线情况未知" : workspaceAgentStates[employee.status] || "在线情况未知");
+  if (employee.model_source) appendFact(facts, "模型来源", employee.model_source);
+  if (current) {
+    const change = currentChange(department, current);
+    if (change) appendFact(facts, "指令版本", (change.scope === "person" ? "个人纠正" : "部门主线") + " v" + change.version);
+    if (current.event_id) appendFact(facts, "事件", "#" + current.event_id);
+    if (current.run_id) appendFact(facts, "轮次", "#" + current.run_id);
+    if (current.note) appendFact(facts, "说明", current.note);
+  }
+  if (historical) {
+    appendFact(facts, "历史来源", historical.source || "管理员登记的历史任务关联");
+    appendFact(facts, "历史轮次", "#" + historical.run_id + " · " + (loopStates[historical.state] || "待核验"));
+    if (historical.finished_at) appendFact(facts, "结束时间", new Date(historical.finished_at).toLocaleString("zh-CN"));
+    if (historical.result) appendFact(facts, "历史结果", historical.result);
+  }
+  if (employee.manual) {
+    appendFact(facts, "自报时间", date(employee.manual.updated));
+    if (employee.manual.detail) appendFact(facts, "自报说明", employee.manual.detail);
+  }
+  details.append(facts);
+  return details;
+}
+
+function renderDepartmentDetails(project, department, open) {
+  const details = el("details", "department-details");
+  details.dataset.department = department.id;
+  details.open = open;
+  details.append(el("summary", "", "部门详情"), workspaceButton("添加观察员工", () => editWorkspaceEmployee(project, department)));
+  const history = el("ol");
+  const names = new Map(department.employees.map(employee => [employee.id, employee.name]));
+  for (const change of department.changes) {
+    const line = el("li");
+    const title = change.scope === "person" ? "个人纠正 · " + (names.get(change.agent) || change.agent) : "主线调整";
+    line.append(el("strong", "", title + " v" + change.version), el("p", "workspace-line-content", change.instruction));
+    if (change.acceptance) line.append(el("p", "workspace-line-content", "验收 · " + change.acceptance));
+    const recipients = change.received_by?.length || 0;
+    const applied = change.applied_by?.length || 0;
+    line.append(el("p", "workspace-muted", ["已保存", recipients ? recipients + " 人已接收" : "", applied ? applied + " 人已生效" : ""].filter(Boolean).join(" · ")));
+    const latestChange = department.changes.find(entry => entry.scope === change.scope &&
+      entry.agent === change.agent && entry.task_id === change.task_id);
+    const deliveries = el("ul");
+    for (const delivery of change.deliveries) {
+      const item = el("li", "", [names.get(delivery.agent) || delivery.agent,
+        workspaceDeliveryStates[delivery.state] || "待确认", delivery.run_id ? "第 " + delivery.run_id + " 轮" : ""].filter(Boolean).join(" · "));
+      for (const [label, value] of [["回执", delivery.result], ["证据", delivery.evidence], ["备注", delivery.note]]) {
+        if (typeof value === "string" && value) item.append(el("p", "workspace-line-content", label + " · " + value));
+      }
+      const latestDelivery = change.deliveries.findLast(entry => entry.agent === delivery.agent && entry.stage !== "scope");
+      if (latestChange === change && latestDelivery === delivery && ["applied", "blocked"].includes(delivery.state) && Number.isInteger(delivery.run_id)) {
+        item.append(workspaceButton("续收同版结果", () => editWorkspaceContinuation(change, delivery)));
+      }
+      if (delivery.evidence_available && delivery.evidence) item.append(workspaceButton("查看现场证据", () => openWorkspaceAttachment(change.id, delivery.evidence)));
+      deliveries.append(item);
+    }
+    if (change.deliveries.length) line.append(deliveries);
+    for (const review of change.reviews || []) {
+      const reviewNote = el("section", "workspace-review");
+      reviewNote.dataset.review = review.id;
+      reviewNote.append(el("strong", "", "独立审核 · " + review.reviewer), el("p", "workspace-line-content", review.conclusion));
+      const facts = el("dl", "employee-facts");
+      if (review.source) appendFact(facts, "来源", review.source);
+      if (review.candidate) appendFact(facts, "候选", review.candidate);
+      if (review.commit) appendFact(facts, "提交", review.commit);
+      if (review.evidence) appendFact(facts, "证据引用", review.evidence);
+      reviewNote.append(facts);
+      if (typeof review.pr === "string" && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(review.pr)) {
+        const link = el("a", "", "打开 GitHub PR");
+        link.href = review.pr;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        reviewNote.append(link);
+      }
+      if (review.evidence) reviewNote.append(workspaceButton("查看审核证据", () => openWorkspaceAttachment(change.id, review.evidence)));
+      line.append(reviewNote);
+    }
+    history.append(line);
+  }
+  details.append(department.changes.length ? history : el("p", "workspace-muted", "暂无指令变更"));
+  return details;
+}
+
+function closeWorkspaceDialog() {
+  workspace.dialog = null;
+  if ($("workspace-dialog").open) $("workspace-dialog").close();
+}
+
+function showWorkspaceDialog(title, options = {}) {
+  const current = {options, revision: workspace.revision, sending: false, signature: null, requestId: null};
+  workspace.dialog = current;
+  $("workspace-dialog-form").dataset.workspaceForm = options.kind || "";
+  $("workspace-dialog-title").textContent = title;
+  $("workspace-dialog-context").textContent = options.context || "";
+  $("workspace-dialog-context").hidden = !options.context;
+  $("workspace-dialog-error").textContent = "";
+  $("workspace-dialog-content").replaceChildren();
+  $("workspace-dialog-submit").textContent = options.submitText || "提交";
+  $("workspace-dialog-submit").hidden = !options.send;
+  $("workspace-dialog-submit").disabled = false;
+  $("workspace-dialog-cancel").disabled = false;
+  for (const field of options.fields || []) {
+    const label = el("label", "", field.label);
+    const input = el(field.multiline ? "textarea" : "input");
+    input.name = field.name;
+    input.required = true;
+    if (field.file) {
+      input.type = "file";
+      input.accept = "application/json,.json";
+    } else {
+      input.maxLength = field.maxLength || 950;
+      input.value = field.value || "";
+      if (field.pattern) input.pattern = field.pattern;
+    }
+    label.append(input);
+    $("workspace-dialog-content").append(label);
+  }
+  $("workspace-dialog").showModal();
+  return current;
+}
+
+async function selectWorkspaceProject() {
+  const current = showWorkspaceDialog("打开项目");
+  const area = $("workspace-dialog-content");
+  area.append(el("p", "", "正在读取项目…"));
+  try {
+    const data = await request("/api/aams/projects");
+    if (workspace.dialog !== current) return;
+    if (!data.projects.length) {
+      area.replaceChildren(el("p", "", "还没有本地项目。请返回新建项目。"));
+      return;
+    }
+    const list = el("ul", "workspace-project-list");
+    for (const project of data.projects) {
+      const row = el("li");
+      const button = workspaceButton(project.name, () => {
+        closeWorkspaceDialog();
+        void openWorkspaceProject(project.id);
+      });
+      button.dataset.projectChoice = project.id;
+      row.append(button);
+      list.append(row);
+    }
+    area.replaceChildren(list);
+    list.querySelector("button").focus();
+  } catch (error) {
+    if (!obsolete(error) && workspace.dialog === current) {
+      area.replaceChildren(el("p", "", "读取本地项目失败。请返回后重试。"));
+    }
+  }
+}
+
+function workspaceRecordId(prefix) {
+  return prefix + "-" + id().slice(0, 12);
+}
+
+function createWorkspaceProject() {
+  const projectId = workspaceRecordId("project");
+  showWorkspaceDialog("新建项目", {
+    fields: [{name: "name", label: "项目名称", maxLength: 80}], submitText: "创建项目",
+    send: values => request("/api/aams/projects", {id: projectId, name: values.name}),
+    done: data => { void openWorkspaceProject(data.id); },
+  });
+}
+
+function editWorkspaceDepartment() {
+  const departmentId = workspaceRecordId("department");
+  const lead = workspaceRecordId("lead");
+  showWorkspaceDialog("新建部门", {
+    fields: [
+      {name: "name", label: "部门名称", maxLength: 80},
+      {name: "lead", label: "负责人标识", value: lead, pattern: "[a-zA-Z0-9_\\-]+", maxLength: 48},
+      {name: "mainline", label: "当前主线", multiline: true},
+    ],
+    submitText: "创建部门",
+    send: values => request("/api/aams/departments", {project: workspace.projectId, id: departmentId, ...values}),
+    done: () => { void refreshWorkspaceProject(true); },
+  });
+}
+
+function editWorkspaceEmployee(project, department) {
+  const employeeId = workspaceRecordId("employee");
+  const taskId = workspaceRecordId("task");
+  showWorkspaceDialog("添加观察员工", {
+    context: project.name + " / " + department.name,
+    fields: [{name: "name", label: "员工姓名", maxLength: 80}, {name: "task_title", label: "当前工作", maxLength: 120}],
+    submitText: "添加员工",
+    send: values => request("/api/aams/employees", {project: project.id, department: department.id, id: employeeId, task_id: taskId, ...values}),
+    done: () => { void refreshWorkspaceProject(true); },
+  });
+}
+
+function editWorkspaceChange(project, department, employee = null) {
+  const expectedVersion = employee ? employee.task.version : department.mainline.version;
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) return;
+  showWorkspaceDialog(employee ? "纠正此 Agent" : "调整主线", {
+    kind: employee ? "person" : "mainline",
+    context: [project.name, department.name, employee?.name, employee?.task.title, "当前 v" + expectedVersion].filter(Boolean).join(" / "),
+    fields: [{name: "instruction", label: employee ? "纠正指令" : "新主线", multiline: true},
+      {name: "acceptance", label: "验收条件", multiline: true}],
+    submitText: "提交指令",
+    send: (values, requestId) => request("/api/aams/changes", {
+      request_id: requestId, project: project.id, department: department.id,
+      scope: employee ? "person" : "mainline", agent: employee?.id || null,
+      task_id: employee?.task.id || null, expected_version: expectedVersion, ...values,
+    }),
+    done: data => {
+      workspaceMessage("已登记 v" + data.version + "，接收与生效以回执为准。");
+      void refreshWorkspaceProject(true);
+    },
+  });
+}
+
+function editWorkspacePause(project, department) {
+  const paused = !department.paused;
+  showWorkspaceDialog(paused ? "暂停后续派发" : "恢复派发", {
+    context: department.name,
+    submitText: paused ? "确认暂停" : "确认恢复",
+    send: () => request("/api/aams/departments/pause", {project: project.id, department: department.id, paused}),
+    done: () => { void refreshWorkspaceProject(true); },
+  });
+}
+
+function editWorkspaceContinuation(change, delivery) {
+  showWorkspaceDialog("续收同版结果", {
+    context: "核对第 " + delivery.run_id + " 轮已生成的结果。",
+    submitText: "确认续收",
+    send: () => request("/api/aams/changes/continue", {id: change.id, agent: delivery.agent, after_run: delivery.run_id}),
+    done: () => { void refreshWorkspaceProject(true); },
+  });
+}
+
+async function openWorkspaceAttachment(changeId, reference) {
+  const current = showWorkspaceDialog("现场证据", {context: reference});
+  const content = $("workspace-dialog-content");
+  content.append(el("p", "", "正在读取证据…"));
+  try {
+    const data = await request("/api/aams/attachment?" + new URLSearchParams({change_id: changeId, ref: reference}));
+    if (workspace.dialog === current) content.replaceChildren(el("pre", "workspace-attachment", JSON.stringify(data, null, 2)));
+  } catch (error) {
+    if (!obsolete(error) && workspace.dialog === current) content.replaceChildren(el("p", "", "证据暂不可读。请核对本机记录。"));
+  }
+}
+
+function editWorkspaceRoster() {
+  const projectId = workspace.projectId;
+  showWorkspaceDialog("导入岗位登记", {
+    context: "按登记文件中的项目与部门绑定岗位。",
+    fields: [{name: "manifest", label: "岗位登记 JSON 文件", file: true}],
+    submitText: "导入登记",
+    send: async values => {
+      if (values.manifest.size > 256 * 1024) throw new Error("岗位登记文件超过 256 KB。");
+      let manifest;
+      try {
+        manifest = JSON.parse(await values.manifest.text());
+      } catch {
+        throw new Error("岗位登记文件须为有效的 JSON。");
+      }
+      if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) throw new Error("岗位登记须为 JSON 对象。");
+      if (manifest.project?.id !== projectId) throw new Error("登记文件中的项目与当前打开的项目不一致。");
+      return request("/api/aams/roster/import", {manifest});
+    },
+    done: () => {
+      workspaceMessage("已导入岗位登记。");
+      void refreshWorkspaceProject(true);
+    },
+  });
+}
+
+$("workspace-create").addEventListener("click", createWorkspaceProject);
+$("workspace-open").addEventListener("click", () => { void selectWorkspaceProject(); });
+$("workspace-back").addEventListener("click", () => returnToWorkspaceHome());
+$("workspace-back-departments").addEventListener("click", returnToWorkspaceDepartments);
+$("workspace-add-department").addEventListener("click", editWorkspaceDepartment);
+$("workspace-import-roster").addEventListener("click", editWorkspaceRoster);
+$("workspace-dialog-cancel").addEventListener("click", closeWorkspaceDialog);
+$("workspace-dialog").addEventListener("cancel", event => {
+  event.preventDefault();
+  if (!workspace.dialog?.sending) closeWorkspaceDialog();
+});
+$("workspace-dialog-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const current = workspace.dialog;
+  if (!current?.options.send || current.sending) return;
+  const form = event.currentTarget;
+  const values = Object.fromEntries([...new FormData(form)].map(([key, value]) => [key, typeof value === "string" ? value.trim() : value]));
+  const message = $("workspace-dialog-error");
+  if (Object.values(values).some(value => typeof value === "string" ? !value : !value.size)) {
+    message.textContent = "请填写所有字段。";
+    return;
+  }
+  const signature = JSON.stringify(values);
+  if (signature !== current.signature) {
+    current.signature = signature;
+    current.requestId = id();
+  }
+  current.sending = true;
+  const inputs = [...form.elements];
+  inputs.forEach(input => { input.disabled = true; });
+  message.textContent = "";
+  try {
+    const data = await current.options.send(values, current.requestId);
+    if (workspace.dialog !== current || workspace.revision !== current.revision) return;
+    closeWorkspaceDialog();
+    current.options.done(data);
+  } catch (error) {
+    if (!obsolete(error) && workspace.dialog === current) {
+      message.textContent = error.status === 409
+        ? (error.message + " 请核对最新状态。") : (error.message || "提交未确认，请核对后重试。");
+      if (error.status === 409) void refreshWorkspaceProject(true);
+    }
+  } finally {
+    inputs.forEach(input => { input.disabled = false; });
+    current.sending = false;
+  }
+});
+setInterval(() => { if (!document.hidden) void refreshWorkspaceProject(); }, 4000);
 void connectOnStartup();

@@ -68,3 +68,18 @@ class BrowserLaunchTest(unittest.TestCase):
     def test_expired_ticket_is_rejected(self):
         with patch.object(web_server.time, "monotonic", return_value=self.server.browser_launch.expires):
             self.assertEqual(self.redeem(self.server.browser_launch.ticket)[0], 401)
+
+    def test_local_launcher_reopens_same_running_database_without_a_reusable_browser_secret(self):
+        other=Path(self.scratch.name)/"unrelated.db"
+        sync.initialize(other)
+        self.assertIsNone(web_server.existing_launch(other,self.port))
+        url=web_server.existing_launch(self.server.db_path,self.port)
+        self.assertTrue(url.startswith(self.origin+"/#launch="))
+        ticket=url.split("#launch=")[1]
+        with sync.connect(self.server.db_path,True) as db:
+            rows=db.execute("SELECT digest FROM aams_launch_tickets").fetchall()
+            self.assertEqual(len(rows),1)
+            self.assertNotEqual(rows[0]["digest"],ticket)
+        self.assertEqual(self.redeem(ticket)[0],200)
+        self.assertEqual(self.redeem(ticket)[0],401)
+        self.assertEqual(self.request("GET","/api/aams/projects")[0],401)
