@@ -253,3 +253,7 @@ C:\Program Files\Google\Chrome\Application\chrome.exe
 可用 TEAM_SYNC_CHROME 指定已安装的官方浏览器可执行文件。QA 只用自己的临时 headless 配置，不读取日常浏览器配置或登录状态；结束后清理临时输入。
 
 截图和不含密钥的记录在 verification/。原生会话 UI 截图使用明确标注的隔离 fixture，不包含真实私有标题或正文；真实元数据与平台消息验收只保存不含私有内容的结果摘要。这些测试不证明任何实际项目工作已经完成。
+
+## Windows 下载
+
+[下载 AAMS Windows ZIP](https://github.com/WhatDoUMing/codex-agents-team-sync/raw/refs/heads/main/release/aams-windows/AAMS-Windows.zip) · [中文使用指南](release/aams-windows/README.md) · [SHA-256 校验](release/aams-windows/SHA256SUMS.txt)
