@@ -19,6 +19,11 @@ from test_sync import make_legacy
 class BrowserProjectFixture(ProjectFixture):
     """Supply captured-format receipts in a disposable Hub ledger, with no external requests."""
 
+    roles = {**ProjectFixture.roles,
+             "test.browser-project": ("浏览器项目经理", "qa-manager"),
+             "test.browser-lead": ("浏览器交付负责人", "qa-lead"),
+             "test.browser-result": ("浏览器交付员工", "qa-worker")}
+
     def __init__(self, root):
         root.mkdir()
         super().__init__(root)
@@ -49,7 +54,18 @@ class BrowserProjectFixture(ProjectFixture):
             return response
         event = response["event"]
         data = json.loads(body["detail"])
-        if body["type"] == "test.scope":
+        if body["type"] == "test.browser-project":
+            self.finish(event, "DEPARTMENT browser-delivery | 核对候选", session=self.runtime("qa-model", "max"))
+        elif body["type"] == "test.browser-lead":
+            self.finish(event, 'STAFF | [["qa-worker","记录候选复测数值"]]', session=self.runtime("qa-model", "max"))
+        elif body["type"] == "test.browser-result":
+            reference = data["evidence_file"]
+            (self.root.parent / reference).write_text(json.dumps({
+                "change_id": data["change_id"], "task_id": data["task_id"], "version": data["version"],
+                "outcome": "passed", "pixel_offset": 0,
+            }), encoding="utf-8")
+            self.finish(event, "APPLIED_RESULT | 隔离复测数值为 0 | " + reference, session=self.runtime("qa-model", "max"))
+        elif body["type"] == "test.scope":
             self.finish(event, "SCOPE player | 浏览器隔离验收仅影响试玩")
         else:
             reference = f"field/browser-{data['change_id']}.json"
@@ -69,11 +85,18 @@ class BrowserProjectFixture(ProjectFixture):
     def roster(self):
         result = manifest()
         result["project"]["name"] = "潮核浏览器测试项目"
+        result["project"]["manager"] = {"id": "qa-manager", "event_type": "test.browser-project", "rule": "浏览器项目经理"}
         reviewer = next(agent for agent in result["departments"][0]["employees"] if agent["id"] == "reviewer")
         reviewer["history_run"] = 10
         result["departments"].append({
             "id": "documentation", "name": "文档池", "lead": "scribe",
             "mainline": "浏览器独立验证", "employees": [],
+        })
+        result["departments"].append({
+            "id": "browser-delivery", "name": "浏览器委托交付池", "lead": "qa-lead", "mainline": "核对候选",
+            "scope_type": "test.browser-lead", "scope_rule": "浏览器交付负责人", "delegation_only": True,
+            "employees": [{"id": "qa-worker", "name": "候选复测员工", "task_id": "qa-delivery-worker",
+                           "task_title": "核对候选数值", "event_type": "test.browser-result", "rule": "浏览器交付员工"}],
         })
         return result
 

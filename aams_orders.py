@@ -87,6 +87,9 @@ class LocalLoop:
     def execution(self, run):
         return {}
 
+    def run_identity(self, run, *, decision=False):
+        return {}
+
     def check(self, row):
         config = json.loads((self.home / "config.json").read_text(encoding="utf-8-sig"))
         address = f"127.0.0.1:{self.port}"
@@ -163,7 +166,8 @@ class LocalLoop:
                 raise Conflict("运行时生效的岗位配置缺少匹配的本机后端身份")
             state = run["state"]
             observed = {"event_id": event_id, "run_id": run_id, "claimed_at": run.get("claimed_at"),
-                        "finished_at": run.get("finished_at"), "state": state, **self.execution(run)}
+                        "finished_at": run.get("finished_at"), "state": state,
+                        **self.run_identity(run), **self.execution(run)}
             if state == "claimed" and run.get("session"):
                 observed["state"] = "running"
             elif state == "done" and run.get("finished_at") and run.get("claimed_at"):
@@ -203,7 +207,8 @@ class LocalLoop:
                                 observed["decision_run_id"] = follow_id
                                 try:
                                     status, result, evidence = self.receipt(row, follow.get("summary"))
-                                    observed.update(state=status,result=result,evidence=evidence,**self.execution(follow))
+                                    observed.update(state=status,result=result,evidence=evidence,
+                                                    **self.run_identity(follow,decision=True),**self.execution(follow))
                                 except Conflict:
                                     observed.update(state="unverified",result="决策续办轮次缺少同版有效回执")
                 else:

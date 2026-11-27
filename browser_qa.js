@@ -103,7 +103,7 @@ async function checkWorkspace(){
  await click("#workspace-open");
  await wait('!!document.querySelector(\'[data-project-choice="tp"]\')',"list and reopen the existing test project");
  await click('[data-project-choice="tp"]');
- await wait("document.querySelectorAll('#department-cards button').length===2","project shows registered departments");
+ await wait("document.querySelectorAll('#department-cards button').length===3","project shows registered departments");
  assert.equal(await evaluate("$('department-view').hidden && $('department-detail-card').children.length===0"),true);
  await workspaceScreenshot("project-departments-desktop.png",1280,900);
  assert.equal(await evaluate("[...$('department-cards').children].every(card=>card.getBoundingClientRect().top===$('department-cards').firstChild.getBoundingClientRect().top)"),true);
@@ -125,7 +125,7 @@ async function checkWorkspace(){
  const mainline=await evaluate("window.__workspacePosts[0]");
  assert.deepEqual([mainline.project,mainline.department,mainline.scope,mainline.agent,mainline.task_id,mainline.expected_version],["tp","combat","mainline",null,null,0]);
  await wait("workspace.project.departments[0].mainline.effective_version===1","manager receipt and worker effect reconcile");
- assert.equal(await evaluate("document.querySelector('.mainline-card').textContent.includes('核对浏览器主线流程')"),true);
+ assert.equal(await evaluate("document.querySelector('#department-view .mainline-card').textContent.includes('核对浏览器主线流程')"),true);
  pass("mainline starts at the department scope and displays the effective revision after receipts");
 
  const player='[data-employee="player"]';
@@ -187,6 +187,21 @@ async function checkWorkspace(){
   await wait("document.querySelector('.department-details').textContent.includes('跳转入口不可用（隔离样例）')","the blocker receipt stays readable in the department details");
   await screenshot("department-blocker-desktop.png",1280,900);
   pass("a terminal blocker retains evidence without claiming a result; older revisions are labeled as reconciliation");
+
+  await click("#workspace-back-departments");
+  await evaluate("[...$('project-delegations').querySelectorAll('button')].find(b=>b.textContent==='提交项目委托').click()");
+  await workspaceForm({task_id:"BROWSER-DELIVERY",instruction:"核对隔离候选",acceptance:"保存可回读的复测数值"});
+  await wait("workspace.project.delegations[0]?.state==='reported'","manager and lead assignments finish through the temporary ledger");
+  const chain = await evaluate("(()=>{const root=workspace.project.delegations[0], lead=root.children[0], worker=lead.children[0];return {agents:[root.agent,lead.agent,worker.agent],sessions:[root,lead,worker].map(c=>c.deliveries[0].session),scope:worker.instruction};})()");
+  assert.deepEqual(chain.agents, ["qa-manager","qa-lead","qa-worker"]);
+  assert.equal(new Set(chain.sessions).size,3);
+  assert.equal(chain.scope,"记录候选复测数值");
+  await evaluate("[...$('project-delegations').querySelectorAll('details')].forEach(item=>item.open=true)");
+  await evaluate("[...$('project-delegations').querySelectorAll('button')].find(b=>b.textContent==='查看现场证据').click()");
+  await wait("$('workspace-dialog-content').textContent.includes('pixel_offset')","worker evidence can be opened under the parent");
+  await click("#workspace-dialog-cancel");
+  await screenshot("project-delegation-desktop.png",1280,900);
+  pass("authenticated project delegation renders separate manager, lead and worker sessions with proof");
 }
 (async()=>{
  try{
@@ -324,7 +339,7 @@ async function checkWorkspace(){
   assert.deepEqual(exceptions,[]);
   const report={passed:true,browser:"installed Chrome headless; isolated temporary profile",checks:passes,
     screenshots:["project-home-desktop.png","project-home-mobile.png","project-departments-desktop.png","department-work-desktop.png",
-      "department-work-mobile.png","department-review-desktop.png","department-blocker-desktop.png",
+      "department-work-mobile.png","department-review-desktop.png","department-blocker-desktop.png","project-delegation-desktop.png",
       "dashboard-desktop.png","dashboard-mobile.png","native-metadata-desktop.png"],runtimeExceptions:exceptions};
   fs.writeFileSync(path.join(output,"browser-results.json"),JSON.stringify(report,null,2));
   process.stdout.write("BROWSER QA PASS: "+passes.length+" checks\n");

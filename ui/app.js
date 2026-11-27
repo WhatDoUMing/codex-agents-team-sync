@@ -556,6 +556,7 @@ const workspaceAgentStates = {
   completed: "已完成", paused: "暂停派发", ready: "待接单",
 };
 const workspaceDeliveryStates = {
+  assigned: "已分派", waiting: "待前序结果",
   ready: "待派发", sending: "派发中", queued: "已排队", claimed: "已接单",
   running: "执行中", unknown: "结果待确认", decision: "待决策", scoped: "已确认范围",
   applied: "已生效", reported: "有结果", blocked: "有卡点", unverified: "待核验",
@@ -604,6 +605,8 @@ function returnToWorkspaceHome(focus = true) {
   $("workspace-tools").hidden = true;
   $("logout").hidden = true;
   $("department-cards").replaceChildren();
+  $("project-delegations").replaceChildren();
+  $("project-delegations").hidden = true;
   $("department-detail-card").replaceChildren();
   workspaceMessage("");
   if (focus) $("project-home-heading").focus();
@@ -624,6 +627,8 @@ async function openWorkspaceProject(projectId, focus = true, departmentId = null
   $("logout").hidden = false;
   $("workspace-project-name").textContent = "本地项目";
   $("department-cards").replaceChildren();
+  $("project-delegations").replaceChildren();
+  $("project-delegations").hidden = true;
   $("department-detail-card").replaceChildren();
   workspaceMessage("正在打开项目…");
   await refreshWorkspaceProject(true);
@@ -680,6 +685,79 @@ function renderWorkspaceProject(project) {
   const content = project.departments.map(renderDepartmentSummary);
   if (!content.length) content.push(el("p", "workspace-empty", "还没有部门。新建部门后即可填写主线与负责人。"));
   $("department-cards").replaceChildren(...content);
+  renderWorkspaceDelegations(project);
+}
+
+function renderWorkspaceDelegations(project) {
+  const area = $("project-delegations");
+  area.hidden = !project.manager;
+  if (area.hidden) return;
+  const open = new Set([...area.querySelectorAll("details[open]")].map(item => item.dataset.delegation));
+  const header = el("div", "mainline-heading");
+  header.append(el("h3", "", "项目委托"), el("span", "workspace-muted", "项目管理员 · " + project.manager));
+  if (project.can_delegate) {
+    header.append(workspaceButton("提交项目委托", () => editWorkspaceDelegation(project)),
+      workspaceButton(project.delegations_paused ? "恢复委托派发" : "暂停后续委托派发", () => editWorkspaceDelegationPause(project)));
+  }
+  const list = el("ol");
+  for (const delegation of project.delegations) list.append(renderDelegation(project, delegation, open));
+  area.replaceChildren(header, list.children.length ? list : el("p", "workspace-muted", "暂无项目委托"));
+}
+
+function renderDelegation(project, delegation, open) {
+  const line = el("li");
+  const details = el("details");
+  details.dataset.delegation = delegation.id;
+  details.open = open.has(delegation.id);
+  const department = project.departments.find(item => item.id === delegation.department);
+  const status = delegation.current ? workspaceDeliveryStates[delegation.state] : "历史版本";
+  const title = [delegation.task_id, "v" + delegation.version, department?.name, delegation.agent, status];
+  details.append(el("summary", "", title.filter(Boolean).join(" · ")),
+    el("p", "workspace-line-content", delegation.instruction));
+  if (!delegation.parent_id) details.append(el("p", "workspace-line-content", "验收 · " + delegation.acceptance));
+  const facts = el("dl", "employee-facts");
+  appendFact(facts, "委托编号", delegation.id);
+  if (delegation.parent_id) appendFact(facts, "上级委托", delegation.parent_id);
+  if (delegation.assigned_run_id) appendFact(facts, "分派来源", delegation.delegated_by + " · Loop #" + delegation.assigned_run_id);
+  if (delegation.predecessor_id) appendFact(facts, "前序任务", delegation.predecessor_id);
+  details.append(facts);
+  for (const delivery of delegation.deliveries) {
+    const receipt = el("section", "workspace-review");
+    const identity = [delivery.agent, workspaceDeliveryStates[delivery.state],
+      delivery.run_id ? "Loop #" + delivery.run_id : ""].filter(Boolean).join(" · ");
+    receipt.append(el("strong", "", identity));
+    const proof = el("dl", "employee-facts");
+    for (const [label, value] of [
+      ["事件", delivery.event_id], ["会话", delivery.session], ["续办会话", delivery.decision_session],
+      ["规则版本", delivery.rules_version], ["接收时间", delivery.claimed_at],
+      ["回执", delivery.result], ["备注", delivery.note], ["候选", delivery.proof?.candidate], ["提交", delivery.proof?.commit],
+    ]) if (value) appendFact(proof, label, String(value));
+    receipt.append(proof);
+    if (delivery.evidence_available) receipt.append(workspaceButton("查看现场证据",
+      () => openWorkspaceAttachment(delegation.id, delivery.evidence)));
+    if (delivery.proof?.pr) {
+      const link = el("a", "", "打开 GitHub PR");
+      link.href = delivery.proof.pr;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      receipt.append(link);
+    }
+    if (delegation.current && delegation.proof_kind && delivery === delegation.deliveries.at(-1) &&
+        ["applied", "blocked"].includes(delivery.state) && delivery.run_id && project.can_delegate) {
+      receipt.append(workspaceButton("续收同版结果", () => editWorkspaceContinuation(delegation, delivery)));
+    }
+    details.append(receipt);
+  }
+  if (delegation.children.length) {
+    const children = el("ol");
+    for (const child of delegation.children) children.append(renderDelegation(project, child, open));
+    details.append(children);
+  }
+  if (!delegation.parent_id && delegation.current && project.can_delegate) {
+    details.append(workspaceButton("修订委托", () => editWorkspaceDelegation(project, delegation)));
+  }
+  line.append(details);
+  return line;
 }
 
 function departmentPresence(department) {
@@ -741,7 +819,8 @@ function renderDepartment(project, department, wasOpen, openEmployees) {
   if (adjust.disabled) adjust.title = "负责人尚未绑定可投递的岗位";
   const version = department.mainline?.version;
   const effectiveVersion = department.mainline?.effective_version ?? version;
-  mainlineHeader.append(el("h4", "", "当前主线"), el("span", "work-version", effectiveVersion ? "v" + effectiveVersion : "初始主线"), adjust);
+  mainlineHeader.append(el("h4", "", "当前主线"), el("span", "work-version", effectiveVersion ? "v" + effectiveVersion : "初始主线"));
+  if (!department.delegation_only) mainlineHeader.append(adjust);
   const instruction = department.mainline?.effective_instruction ?? department.mainline?.instruction;
   mainline.append(mainlineHeader, el("p", "workspace-line-content", instruction || "尚未填写主线"));
   if (version > effectiveVersion) {
@@ -823,7 +902,7 @@ function renderEmployee(project, department, employee, detailOpen) {
   );
   card.append(heading, task, facts, receipts);
 
-  if (employee.task) {
+  if (employee.task && !department.delegation_only) {
     const correct = workspaceButton("纠正此 Agent", () => editWorkspaceChange(project, department, employee));
     correct.dataset.workspaceAction = department.id + ":" + employee.id + ":correct";
     correct.disabled = !employee.can_correct || employee.channel !== "loop";
@@ -847,7 +926,7 @@ function renderEmployeeDetails(project, department, employee, open) {
   if (employee.model_source) appendFact(facts, "模型来源", employee.model_source);
   if (current) {
     const change = currentChange(department, current);
-    if (change) appendFact(facts, "指令版本", (change.scope === "person" ? "个人纠正" : "部门主线") + " v" + change.version);
+    if (change) appendFact(facts, "指令版本", (change.parent_id ? "项目委托" : change.scope === "person" ? "个人纠正" : "部门主线") + " v" + change.version);
     if (current.event_id) appendFact(facts, "事件", "#" + current.event_id);
     if (current.run_id) appendFact(facts, "轮次", "#" + current.run_id);
     if (current.note) appendFact(facts, "说明", current.note);
@@ -874,6 +953,7 @@ function renderDepartmentDetails(project, department, open) {
   const history = el("ol");
   const names = new Map(department.employees.map(employee => [employee.id, employee.name]));
   for (const change of department.changes) {
+    if (change.parent_id) continue;
     const line = el("li");
     const title = change.scope === "person" ? "个人纠正 · " + (names.get(change.agent) || change.agent) : "主线调整";
     line.append(el("strong", "", title + " v" + change.version), el("p", "workspace-line-content", change.instruction));
@@ -920,7 +1000,11 @@ function renderDepartmentDetails(project, department, open) {
     }
     history.append(line);
   }
-  details.append(department.changes.length ? history : el("p", "workspace-muted", "暂无指令变更"));
+  if (department.delegation_only) {
+    details.append(workspaceButton("查看项目委托", returnToWorkspaceDepartments));
+  } else {
+    details.append(history.children.length ? history : el("p", "workspace-muted", "暂无指令变更"));
+  }
   return details;
 }
 
@@ -1051,6 +1135,36 @@ function editWorkspaceChange(project, department, employee = null) {
       workspaceMessage("已登记 v" + data.version + "，接收与生效以回执为准。");
       void refreshWorkspaceProject(true);
     },
+  });
+}
+
+function editWorkspaceDelegation(project, delegation = null) {
+  const fields = delegation ? [] : [{name: "task_id", label: "任务编号", pattern: "[A-Za-z0-9_\\-]+", maxLength: 80}];
+  fields.push({name: "instruction", label: "委托目标", multiline: true, value: delegation?.instruction},
+    {name: "acceptance", label: "验收条件", multiline: true, value: delegation?.acceptance});
+  showWorkspaceDialog(delegation ? "修订项目委托" : "提交项目委托", {
+    kind: "delegation",
+    context: [project.name, delegation?.task_id, delegation ? "当前 v" + delegation.version : null].filter(Boolean).join(" / "),
+    fields,
+    submitText: "提交委托",
+    send: (values, requestId) => request("/api/aams/delegations", {
+      request_id: requestId, project: project.id, task_id: delegation?.task_id || values.task_id,
+      expected_version: delegation?.version || 0, instruction: values.instruction, acceptance: values.acceptance,
+    }),
+    done: data => {
+      workspaceMessage("已登记委托 v" + data.version + "，接单以 Loop 回执为准。");
+      void refreshWorkspaceProject(true);
+    },
+  });
+}
+
+function editWorkspaceDelegationPause(project) {
+  const paused = !project.delegations_paused;
+  showWorkspaceDialog(paused ? "暂停后续委托派发" : "恢复委托派发", {
+    context: project.name,
+    submitText: paused ? "确认暂停" : "确认恢复",
+    send: () => request("/api/aams/delegations/pause", {project: project.id, paused}),
+    done: () => { void refreshWorkspaceProject(true); },
   });
 }
 

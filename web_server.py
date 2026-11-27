@@ -313,11 +313,13 @@ class Handler(BaseHTTPRequestHandler):
             registry=self.server.projects
             actions={"/api/aams/projects":registry.create_project,"/api/aams/departments":registry.add_department,
                      "/api/aams/employees":registry.employee,"/api/aams/changes":registry.issue,
+                     "/api/aams/delegations":registry.issue_delegation,"/api/aams/delegations/pause":registry.pause_delegations,
                      "/api/aams/changes/continue":registry.continue_change,"/api/aams/departments/pause":registry.pause,
                      "/api/aams/roster/import":registry.configure,"/api/aams/reviews":registry.review}
             if self.path in actions:
                 try:
-                    if self.path in ("/api/aams/changes","/api/aams/changes/continue","/api/aams/departments/pause") and registry.loop is None:
+                    if self.path in ("/api/aams/changes","/api/aams/changes/continue","/api/aams/departments/pause",
+                                     "/api/aams/delegations","/api/aams/delegations/pause") and registry.loop is None:
                         self._reply(403,{"error":"当前入口仅观察，请使用本机操作看板"})
                         return
                     self._reply(200,actions[self.path](**body))
@@ -408,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = do_PUT
 
 
-def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, codex_cli=None, owned_factory=None, loop_probe=None, control=None, open_browser=False, order_loop=None, evidence_root=None, project_loop=None, project_evidence_root=None):
+def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, codex_cli=None, owned_factory=None, loop_probe=None, control=None, open_browser=False, order_loop=None, evidence_root=None, project_loop=None, project_evidence_root=None, delegation_evidence_root=None):
     if host != "127.0.0.1":
         raise ValueError("only 127.0.0.1 loopback binding is permitted")
     if type(port) is not int or not 0 <= port <= 65535:
@@ -446,7 +448,7 @@ def create_server(path, host="127.0.0.1", port=8765, token=None, source=None, co
             server.server_close()
             raise
     server.orders = None
-    server.projects=ProjectBoard(path,project_loop,project_evidence_root)
+    server.projects=ProjectBoard(path,project_loop,project_evidence_root,delegation_evidence_root)
     server.projects.start()
     server.evidence = EvidenceLibrary(evidence_root)
     if order_loop is not None:
@@ -468,8 +470,37 @@ def open_local_dashboard(url):
     print("Could not open the browser. Open the dashboard using the fallback session key above.", flush=True)
 
 
+def configured_project_loop(control, dashboard_port):
+    home_value = os.environ.get("AAMS_PROJECT_HUB_HOME")
+    port_value = os.environ.get("AAMS_PROJECT_HUB_PORT")
+    if home_value is None and port_value is None:
+        return ProjectLoop() if control else None
+    if not home_value or not port_value:
+        raise ValueError("AAMS_PROJECT_HUB_HOME and AAMS_PROJECT_HUB_PORT must be set together")
+    try:
+        hub_port = int(port_value)
+    except ValueError as exc:
+        raise ValueError("AAMS_PROJECT_HUB_PORT must be an integer from 1 through 65535") from exc
+    if not 1 <= hub_port <= 65535 or (dashboard_port and hub_port == dashboard_port):
+        raise ValueError("AAMS_PROJECT_HUB_PORT must be a free local Hub port distinct from the dashboard")
+    home = Path(home_value).expanduser().resolve()
+    config_path = home / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("The selected local Hub must have a readable config.json") from exc
+    address = f"127.0.0.1:{hub_port}"
+    hub_config = config.get("hub") if isinstance(config, dict) else None
+    if (not isinstance(hub_config, dict) or config.get("url") != "http://" + address
+            or hub_config.get("listen") != address):
+        raise ValueError("The selected Hub config must bind exactly to its explicit 127.0.0.1 address")
+    return ProjectLoop(home=home, port=hub_port)
+
+
 def serve(path, host="127.0.0.1", port=8765, source=None, codex_cli=None, open_browser=False):
-    control = loop_control.configured()
+    release_mode = os.environ.get("AAMS_WINDOWS_RELEASE") == "1"
+    control = None if release_mode else loop_control.configured()
+    project_loop = configured_project_loop(control, port)
     if open_browser and host=="127.0.0.1" and port:
         url=existing_launch(path,port)
         if url:
@@ -477,11 +508,17 @@ def serve(path, host="127.0.0.1", port=8765, source=None, codex_cli=None, open_b
             return
     server = create_server(path, host, port, source=source, codex_cli=codex_cli,
                            control=control, open_browser=open_browser, order_loop=LocalLoop() if control else None,
-                           project_loop=ProjectLoop() if control else None,project_evidence_root=os.environ.get("AAMS_PROJECT_EVIDENCE_ROOT"),
+                           project_loop=project_loop,project_evidence_root=os.environ.get("AAMS_PROJECT_EVIDENCE_ROOT"),
+                           delegation_evidence_root=os.environ.get("AAMS_DELEGATION_EVIDENCE_ROOT"),
                            evidence_root=os.environ.get("AAMS_EVIDENCE_ROOT") if control else None)
     url = "http://" + server.launch_host + "/"
     print("Local dashboard: " + url, flush=True)
-    print("Session access key (manual fallback only; not in URL): " + server.access_token, flush=True)
+    print("Session access key (manual fallback only; valid during this process run; do not share): " + server.access_token, flush=True)
+    print("Browser launch tickets are separate and single-use.", flush=True)
+    if release_mode:
+        print("Legacy CAS control is disabled in this Windows release.", flush=True)
+        print("AAMS project dispatch uses only an explicitly selected local Hub." if project_loop else
+              "AAMS project dispatch is disabled until a local Hub is explicitly selected.", flush=True)
     if server.browser_launch is not None:
         launch_url = url + "#launch=" + server.browser_launch.ticket
         threading.Thread(target=open_local_dashboard, args=(launch_url,), daemon=True).start()
@@ -496,3 +533,4 @@ def serve(path, host="127.0.0.1", port=8765, source=None, codex_cli=None, open_b
         if server.owned is not None:
             server.owned.close()
         server.server_close()
+        print("AAMS dashboard stopped.", flush=True)

@@ -28,6 +28,18 @@
 
 卡片模型和思考档位取自该次 Loop 领取和结束之间、同一 Codex 会话的 `turn_context`。无法核实的字段显示未知。管理员可以通过岗位登记的 `history_run` 关联一轮先前工作，详情会说明历史来源，本轮接单仍由本轮回执判断。
 
+## 项目委托
+
+在岗位登记的 `project` 中填写 `"manager":{"id":"project-manager","event_type":"studio.delegate","rule":"项目委托判断"}`。在单独的委托部门设置 `"delegation_only":true`、负责人及其 `scope_type` 和 `scope_rule`。该部门经项目经理分派，员工名单沿用登记的工作岗位和专用 Loop 路由。
+
+总主管从项目页选择「提交项目委托」，填写任务号、委托目标和验收条件。该操作对应经鉴权的 `POST /api/aams/delegations`，参数为 `request_id`、`project`、`task_id`、`expected_version`、`instruction` 和 `acceptance`。首次提交的当前版号为 0，后续通过「修订委托」沿同一任务号递增。项目经理使用本次事件的 `AAMS/2 <event.id> DEPARTMENT 部门ID | 分派范围与理由`。AAMS 核对实际轮次和会话后交给独立的部门负责人。
+
+负责人根据本次可控员工和任务范围，按 `AAMS/2 <event.id> STAFF | [["员工ID","具体子任务范围"],["员工ID","具体子任务范围"]]` 返回自己的安排。第一个竖线分隔命令和数组，数组内的 JSON 字符串可以包含竖线。每个子任务沿用父单版号并记录分派来源。执行顺序采用回执数组的顺序。后续任务等待上一笔通过并可重新核对的实录。员工可通过绑定的 `APPLIED` 或 `BLOCKED` 回传中间状态，现场证据齐备后可从看板续收同版结果。旧版的已领取工作保留原回执，尚未派发的旧版分支在修订时失效。
+
+员工按事件提供的 `evidence_file` 保存实际 JSON，再用 `APPLIED_RESULT` 回传该路径。JSON 至少包含 `change_id`、`task_id`、`version` 与 `outcome`（`passed` 或 `failed`）。用于交付的员工可登记 `"proof_kind":"pr"`，随前序实测候选报告 `candidate`、`commit` 和 GitHub `pr`。随后负责复核的独立岗位登记 `"proof_kind":"review"`，核对同一候选、提交和 PR 并回传自己的实录。其余员工默认为 `result`。`AAMS_DELEGATION_EVIDENCE_ROOT` 指定项目委托的现场目录，默认沿用已有的项目证据目录。
+
+项目页可回看各级范围、子任务编号、实际接单身份、Loop 事件、轮次、会话与实录。使用「暂停后续委托派发」可以冻结新派发，已领取工作按原轮次核对。
+
 ## 工单证据与独立审核
 
 启动前将 `AAMS_PROJECT_EVIDENCE_ROOT` 指向本机业务证据目录。执行者可提交该目录下的 `field/record-<change_id>.json`。记录写入顶层 `change_id`，如包含 `task` 或 `task_id`，内容要和这份回执的当前任务一致。已核验并跨版复用的基线 `field/candidate.json` 使用任务号、源清单和脚本 SHA-256 标明来源。看板只读取与相应回执或复核关联的文件。

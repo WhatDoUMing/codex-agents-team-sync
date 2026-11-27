@@ -121,6 +121,7 @@ body {
 .workspace-feedback-error, #workspace-dialog-error { color: var(--workspace-error) !important; }
 
 #department-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 16px; }
+.project-delegations { margin-top: 16px; }
 .department-card {
   display: grid;
   gap: 16px;

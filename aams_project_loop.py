@@ -11,8 +11,21 @@ from aams_orders import LocalLoop
 from cas_loop_flow import Conflict
 
 
+PROJECT_DELEGATION = "project-delegation"
+DEPARTMENT_DELEGATION = "department-delegation"
+EMPLOYEE_DELEGATION = "employee-delegation"
+DELEGATION_SCOPES = (PROJECT_DELEGATION, DEPARTMENT_DELEGATION, EMPLOYEE_DELEGATION)
+ASSIGNMENT_STAGES = ("assign-department", "assign-staff")
+SESSION_ID = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
+
+
 def instant(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def delegation_evidence(row):
+    suffix = "-" + row["stage"].removeprefix("report-") if row["stage"].startswith("report-") else ""
+    return f"field/record-{row['change_id']}{suffix}.json"
 
 
 class ProjectLoop(LocalLoop):
@@ -37,6 +50,20 @@ class ProjectLoop(LocalLoop):
         if row["stage"].startswith("report-"):
             detail["continuation"] = "同版续收。仅核验本版已经生成的证据，禁止重复执行或重开游戏。"
             detail["after_run"] = int(row["stage"].removeprefix("report-"))
+        if row["scope"] in DELEGATION_SCOPES:
+            detail.update(json.loads(row["context"]), stage=row["stage"], parent_id=row["parent_id"],
+                          assigned_run_id=row["assigned_run_id"])
+            if row["scope"] == EMPLOYEE_DELEGATION:
+                detail["evidence_file"] = delegation_evidence(row)
+            if row["previous_proof"]:
+                detail["previous"] = {"id": row["predecessor_id"], "receipt": row["previous_result"],
+                                      "evidence_file": row["previous_ref"], "task_id": row["previous_task"],
+                                      **json.loads(row["previous_proof"])}
+            if row["stage"] == "assign-department":
+                detail["receipt_format"] = [prefix + "DEPARTMENT 部门ID | 分派范围与理由", detail["receipt_format"][-1]]
+            elif row["stage"] == "assign-staff":
+                detail["receipt_format"] = [prefix + 'STAFF | [["员工ID","具体子任务范围"],["员工ID","具体子任务范围"]]',
+                                            detail["receipt_format"][-1]]
         return {"id":row["token"],"type":row["event_type"],"subject":row["token"],
                 "summary":f'{row["department"]} · {row["scope"]} v{row["version"]}',
                 "detail":json.dumps(detail,ensure_ascii=False,separators=(",",":"))}
@@ -45,9 +72,34 @@ class ProjectLoop(LocalLoop):
         prefix = "AAMS/2 " + row["token"] + " "
         if not isinstance(summary,str) or not summary.startswith(prefix) or len(summary.encode("utf-16-le")) >= 1000:
             raise Conflict("回执的绑定码或长度无效")
-        parts = [s.strip() for s in summary[len(prefix):].split("|")]
+        receipt = summary[len(prefix):]
+        command, separator, payload = receipt.partition("|")
+        if row["stage"] == "assign-staff" and separator and command.strip() == "STAFF":
+            try:
+                assignments = json.loads(payload)
+                if not isinstance(assignments, list) or not 1 <= len(assignments) <= 10:
+                    raise ValueError()
+                available = {item["agent"] for item in json.loads(row["roster"])}
+                seen = set()
+                for assignment in assignments:
+                    if not isinstance(assignment, list) or len(assignment) != 2:
+                        raise ValueError()
+                    agent, instruction = assignment
+                    if (not isinstance(agent, str) or agent not in available or agent in seen or
+                            not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 240 or
+                            any(ord(ch) < 32 for ch in instruction)):
+                        raise ValueError()
+                    seen.add(agent)
+            except (TypeError, ValueError):
+                raise Conflict("部门负责人必须独立指定登记员工与具体子任务") from None
+            return "assigned", "已确定员工分派顺序与各自范围", json.dumps(assignments, ensure_ascii=False)
+        parts = [s.strip() for s in receipt.split("|")]
         if len(parts)==3 and all(parts) and parts[0]=="BLOCKED":
             return "blocked",parts[1],parts[2]
+        if row["stage"] == "assign-department" and len(parts) == 2 and parts[0].startswith("DEPARTMENT ") and parts[1]:
+            department = parts[0][len("DEPARTMENT "):]
+            if any(item["department"] == department for item in json.loads(row["roster"])):
+                return "assigned", parts[1], department
         if row["stage"]=="scope" and len(parts)==2 and parts[0].startswith("SCOPE ") and parts[1]:
             selected = parts[0][6:]
             agents = [] if selected=="NONE" else [a.strip() for a in selected.split(",")]
@@ -55,9 +107,17 @@ class ProjectLoop(LocalLoop):
             if len(agents)!=len(set(agents)) or not set(agents).issubset(roster):
                 raise Conflict("负责人所选岗位不属于本版可控任务范围")
             return "scoped",parts[1],json.dumps(agents,ensure_ascii=False,separators=(",",":"))
-        if row["stage"]!="scope" and len(parts)==3 and all(parts) and parts[0] in ("APPLIED","APPLIED_RESULT"):
+        if row["stage"] not in (*ASSIGNMENT_STAGES, "scope") and len(parts)==3 and all(parts) and parts[0] in ("APPLIED","APPLIED_RESULT"):
             return ("applied" if parts[0]=="APPLIED" else "reported"),parts[1],parts[2]
         raise Conflict("回执缺少本岗位要求的作用范围、实际结果或证据")
+
+    def run_identity(self, run, *, decision=False):
+        session = run.get("session") or ""
+        if not isinstance(session, str) or not SESSION_ID.fullmatch(session):
+            return {}
+        if decision:
+            return {"decision_session": session}
+        return {"session": session, "rules_version": run.get("rules_version")}
 
     def presence(self):
         config=json.loads((self.home/"config.json").read_text(encoding="utf-8-sig"))
@@ -101,7 +161,7 @@ class ProjectLoop(LocalLoop):
 
     def execution(self, run):
         session=run.get("session") or ""
-        if not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}",session) or not run.get("claimed_at"):
+        if not SESSION_ID.fullmatch(session) or not run.get("claimed_at"):
             return {}
         key=(session,run.get("id"),run.get("claimed_at"),run.get("finished_at"))
         if key in self.finished_models:
